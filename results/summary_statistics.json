@@ -1,0 +1,30 @@
+{
+  "dataset_info": {
+    "total_gallery_images": 106,
+    "total_test_images": 26,
+    "successfully_processed_test_images": 26
+  },
+  "similarity_statistics": {
+    "mean_similarity": 0.6558449864387512,
+    "median_similarity": 0.645437479019165,
+    "std_similarity": 0.12581227719783783,
+    "min_similarity": 0.43268269300460815,
+    "max_similarity": 0.9459785223007202,
+    "q25_similarity": 0.5888359397649765,
+    "q75_similarity": 0.681566134095192
+  },
+  "threshold_analysis": {
+    "threshold_0.3": 26,
+    "threshold_0.4": 26,
+    "threshold_0.5": 24,
+    "threshold_0.6": 18,
+    "threshold_0.7": 5,
+    "threshold_0.8": 3,
+    "threshold_0.9": 3
+  },
+  "performance_metrics": {
+    "accuracy_at_0.5": 0.9230769230769231,
+    "accuracy_at_0.6": 0.6923076923076923,
+    "accuracy_at_0.7": 0.19230769230769232
+  }
+}

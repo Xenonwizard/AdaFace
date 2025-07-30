@@ -1,0 +1,75 @@
+================================================================================
+ADAFACE YANGMI DATASET COMPREHENSIVE ANALYSIS REPORT
+================================================================================
+Generated on: 2025-07-30 11:51:11
+
+1. DATASET OVERVIEW
+----------------------------------------
+Gallery Images (Training): 106
+Test Images: 26
+Successfully Processed Test Images: 26
+Processing Success Rate: 100.0%
+
+2. SIMILARITY DISTRIBUTION ANALYSIS
+----------------------------------------
+Mean Similarity: 0.6558
+Median Similarity: 0.6454
+Standard Deviation: 0.1258
+Minimum Similarity: 0.4327
+Maximum Similarity: 0.9460
+25th Percentile: 0.5888
+75th Percentile: 0.6816
+
+3. THRESHOLD PERFORMANCE ANALYSIS
+----------------------------------------
+Threshold 0.3: 26/26 (100.0%)
+Threshold 0.4: 26/26 (100.0%)
+Threshold 0.5: 24/26 (92.3%)
+Threshold 0.6: 18/26 (69.2%)
+Threshold 0.7: 5/26 (19.2%)
+Threshold 0.8: 3/26 (11.5%)
+Threshold 0.9: 3/26 (11.5%)
+
+4. PERFORMANCE INTERPRETATION
+----------------------------------------
+Overall Performance: GOOD
+Interpretation: AdaFace shows good performance on YangMi dataset
+
+5. TOP AND BOTTOM PERFORMING MATCHES
+----------------------------------------
+TOP 5 MATCHES:
+  download (6).jpeg → 300px-YangMi.jpg (sim: 0.9460)
+  images - 2025-07-22T165147.205.jpeg → images - 2025-07-22T165147.138.jpeg (sim: 0.9334)
+  09ca4912922019f7ac585b75c65fa134.jpg → images (19).jpeg (sim: 0.9095)
+  images - 2025-07-22T165147.336.jpeg → 05b92b4b034af2836310927f77be0350.jpg (sim: 0.7839)
+  download (9).jpeg → chinese-actress-yang-mi-wearing-a-valentino-dress-poses-during-a-fan-meeting-event-for-her-movie-tiny-times-40-in-guangzhou-city-south-chinas-gua-W8JKCB.jpg (sim: 0.7603)
+
+BOTTOM 5 MATCHES:
+  images - 2025-07-22T165147.907.jpeg → images (66).jpeg (sim: 0.4327)
+  images - 2025-07-22T165146.881.jpeg → chinese-actress-yang-mi-is-pictured-at-the-shanghai-hongqiao-international-airport-in-shanghai-china-23-june-2017-W7PHYB.jpg (sim: 0.4695)
+  images - 2025-07-22T165147.196.jpeg → download (14).jpeg (sim: 0.5020)
+  images (93).jpeg → 001ec9790963135073612e.jpg (sim: 0.5362)
+  images (87).jpeg → chinese-actress-yang-mi-wearing-a-valentino-dress-poses-during-a-fan-meeting-event-for-her-movie-tiny-times-40-in-guangzhou-city-south-chinas-gua-W8JKCB.jpg (sim: 0.5400)
+
+6. QUALITY ASSESSMENT
+----------------------------------------
+High Quality Matches (>0.8): 3 (11.5%)
+Medium Quality Matches (0.6-0.8): 15 (57.7%)
+Low Quality Matches (≤0.6): 8 (30.8%)
+
+7. RECOMMENDATIONS
+----------------------------------------
+⚠ Consider collecting more diverse training images
+⚠ Check image quality and lighting conditions
+⚠ Consider fine-tuning the model on this specific dataset
+⚠ Less than 50% high-quality matches - investigate data quality
+
+8. FILES GENERATED
+----------------------------------------
+- comprehensive_analysis.txt (this file)
+- detailed_results.csv (all similarity scores)
+- summary_statistics.json (machine-readable stats)
+- similarity_distribution.png (histogram)
+- top_matches_visualization.png (visual matches)
+
+================================================================================
