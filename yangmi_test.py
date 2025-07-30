@@ -352,7 +352,7 @@ class AdaFaceYangMiTester:
 
 def main():
     # Initialize tester with best pretrained model
-    tester = AdaFaceYangMiTester(model_name='ir101')  # Use the best model
+    tester = AdaFaceYangMiTester(model_name='ir_101')  # Use the best model
     
     # Set paths
     gallery_dir = 'elifiles/images/yangmi'  # Training images
