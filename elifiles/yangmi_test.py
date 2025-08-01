@@ -1,397 +1,562 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision.models import resnet50
 import os
 import cv2
 import numpy as np
 from glob import glob
-from face_alignment import align
-from inference import load_pretrained_model, to_input
-import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import json
+import warnings
+warnings.filterwarnings('ignore')
 
-class AdaFaceYangMiTester:
-    def __init__(self, model_name='ir_50'):
-        """
-        Initialize AdaFace tester
-        model_name: 'ir_18', 'ir_50', 'ir_100' - choose best pretrained model
-        """
-        print(f"Loading AdaFace model: {model_name}")
-        self.model = load_pretrained_model(model_name)
-        self.model.eval()
+class YangMiFaceDataset(Dataset):
+    """Face dataset similar to your AdaFace approach but with OpenCV face detection"""
+    def __init__(self, image_paths, labels, img_size=224, is_training=True):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.img_size = img_size
+        self.is_training = is_training
         
-    def extract_features(self, image_path):
-        """Extract features from a single image"""
+        # Initialize face cascade (similar to your align.get_aligned_face approach)
+        self.face_cascade = self._init_face_cascade()
+        
+        # Define transforms (similar to your to_input function)
+        if is_training:
+            self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+    
+    def _init_face_cascade(self):
+        """Initialize face cascade - handles different OpenCV versions"""
+        cascade_paths = [
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
+            '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
+            '/usr/local/share/opencv/haarcascades/haarcascade_frontalface_default.xml'
+        ]
+        
+        for path in cascade_paths:
+            if os.path.exists(path):
+                return cv2.CascadeClassifier(path)
+        
+        print("Warning: Face cascade not found, using center crop")
+        return None
+    
+    def detect_and_align_face(self, image):
+        """Face detection and alignment (similar to your align.get_aligned_face)"""
+        if self.face_cascade is None:
+            # Fallback to center crop
+            h, w = image.shape[:2]
+            size = min(h, w)
+            y = (h - size) // 2
+            x = (w - size) // 2
+            return image[y:y+size, x:x+size]
+        
         try:
-            # Align face using MTCNN
-            aligned_rgb_img = align.get_aligned_face(image_path)
-            if aligned_rgb_img is None:
-                print(f"No face detected in {image_path}")
-                return None
-                
-            # Convert to model input format (BGR, normalized)
-            bgr_input = to_input(aligned_rgb_img)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
             
-            # Extract features
-            with torch.no_grad():
-                feature, _ = self.model(bgr_input)
-                # Normalize features
-                feature = feature / torch.norm(feature, dim=1, keepdim=True)
+            if len(faces) > 0:
+                # Use largest face (similar to your approach)
+                largest_face = max(faces, key=lambda x: x[2] * x[3])
+                x, y, w, h = largest_face
                 
-            return feature.cpu().numpy().flatten()
+                # Add padding
+                padding = int(0.3 * min(w, h))
+                x = max(0, x - padding)
+                y = max(0, y - padding)
+                w = min(image.shape[1] - x, w + 2 * padding)
+                h = min(image.shape[0] - y, h + 2 * padding)
+                
+                return image[y:y+h, x:x+w]
+            else:
+                # Fallback to center crop
+                h, w = image.shape[:2]
+                size = min(h, w)
+                y = (h - size) // 2
+                x = (w - size) // 2
+                return image[y:y+size, x:x+size]
+        except:
+            # Fallback to center crop
+            h, w = image.shape[:2]
+            size = min(h, w)
+            y = (h - size) // 2
+            x = (w - size) // 2
+            return image[y:y+size, x:x+size]
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        
+        try:
+            # Load image (similar to your extract_features approach)
+            image = cv2.imread(img_path)
+            if image is None:
+                return torch.zeros(3, self.img_size, self.img_size), label
+            
+            # Convert BGR to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Detect and align face
+            face = self.detect_and_align_face(image)
+            
+            # Apply transforms
+            face = self.transform(face)
+            
+            return face, label
             
         except Exception as e:
-            print(f"Error processing {image_path}: {str(e)}")
-            return None
+            print(f"Error processing {img_path}: {e}")
+            return torch.zeros(3, self.img_size, self.img_size), label
+
+class YangMiTransferLearner:
+    """Transfer learning approach inspired by your AdaFace tester structure"""
+    
+    def __init__(self, model_name='resnet50', num_classes=2):
+        """
+        Initialize transfer learner
+        model_name: backbone model to use
+        num_classes: 2 for YangMi vs Others
+        """
+        print(f"Loading pretrained model: {model_name}")
+        self.model_name = model_name
+        self.num_classes = num_classes
+        
+        # Load pretrained backbone
+        self.model = resnet50(pretrained=True)
+        
+        # Freeze early layers (transfer learning approach)
+        self.freeze_backbone()
+        
+        # Modify classifier for YangMi recognition
+        self.modify_classifier()
+        
+        # Setup device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        try:
+            self.model.to(self.device)
+            # Test with dummy input
+            test_input = torch.randn(1, 3, 224, 224).to(self.device)
+            with torch.no_grad():
+                _ = self.model(test_input)
+            print("✓ Model successfully loaded to device")
+        except Exception as e:
+            print(f"GPU error: {e}, falling back to CPU")
+            self.device = torch.device('cpu')
+            self.model.to(self.device)
+    
+    def freeze_backbone(self):
+        """Freeze early layers for transfer learning"""
+        print("Freezing backbone layers...")
+        
+        # Freeze all layers except final ones
+        for name, param in self.model.named_parameters():
+            if 'layer4' not in name and 'fc' not in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+    
+    def modify_classifier(self):
+        """Replace final layer for YangMi classification"""
+        num_features = self.model.fc.in_features
+        
+        self.model.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, self.num_classes)
+        )
+        
+        print(f"Modified classifier for {self.num_classes} classes")
     
     def process_gallery_images(self, gallery_dir):
-        """Process all images in gallery (training) folder"""
+        """Process gallery images (similar to your original function)"""
         print(f"Processing gallery images from {gallery_dir}")
         
-        # Get all image files
+        # Get all image files (same extensions as your code)
         image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
         image_files = []
         for ext in image_extensions:
             image_files.extend(glob(os.path.join(gallery_dir, ext)))
             image_files.extend(glob(os.path.join(gallery_dir, ext.upper())))
         
-        gallery_features = []
-        gallery_paths = []
+        if len(image_files) == 0:
+            raise ValueError(f"No images found in {gallery_dir}")
         
-        for img_path in tqdm(image_files, desc="Processing gallery"):
-            feature = self.extract_features(img_path)
-            if feature is not None:
-                gallery_features.append(feature)
-                gallery_paths.append(img_path)
-        
-        if len(gallery_features) == 0:
-            raise ValueError("No valid gallery images found!")
-            
-        return np.array(gallery_features), gallery_paths
+        print(f"Found {len(image_files)} gallery images")
+        return image_files
     
-    def process_test_images(self, test_dir):
-        """Process all images in test folder"""
-        print(f"Processing test images from {test_dir}")
+    def process_negative_images(self, negative_dir):
+        """Process negative samples"""
+        if negative_dir and os.path.exists(negative_dir):
+            print(f"Processing negative images from {negative_dir}")
+            
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+            image_files = []
+            for ext in image_extensions:
+                image_files.extend(glob(os.path.join(negative_dir, ext)))
+                image_files.extend(glob(os.path.join(negative_dir, ext.upper())))
+            
+            print(f"Found {len(image_files)} negative images")
+            return image_files
+        else:
+            return []
+    
+    def prepare_training_data(self, gallery_dir, negative_dir=None, test_size=0.2, batch_size=8):
+        """Prepare training data (inspired by your data processing approach)"""
+        print("Preparing training dataset...")
         
-        # Get all image files
+        # Get positive samples (YangMi)
+        positive_files = self.process_gallery_images(gallery_dir)
+        
+        # Get negative samples
+        negative_files = self.process_negative_images(negative_dir)
+        
+        # Create balanced dataset
+        if len(negative_files) == 0:
+            print("No negative samples found, creating synthetic negatives...")
+            # Use some positive samples as synthetic negatives (with different augmentation)
+            negative_files = positive_files[:len(positive_files)//3]
+        
+        # Balance the dataset
+        min_samples = min(len(positive_files), len(negative_files))
+        positive_files = positive_files[:min_samples]
+        negative_files = negative_files[:min_samples]
+        
+        # Combine data
+        all_files = positive_files + negative_files
+        all_labels = [1] * len(positive_files) + [0] * len(negative_files)
+        
+        print(f"Dataset prepared:")
+        print(f"  Positive samples (YangMi): {len(positive_files)}")
+        print(f"  Negative samples (Others): {len(negative_files)}")
+        print(f"  Total samples: {len(all_files)}")
+        
+        # Split into train/validation
+        train_files, val_files, train_labels, val_labels = train_test_split(
+            all_files, all_labels, test_size=test_size, random_state=42, stratify=all_labels
+        )
+        
+        # Create datasets
+        train_dataset = YangMiFaceDataset(train_files, train_labels, is_training=True)
+        val_dataset = YangMiFaceDataset(val_files, val_labels, is_training=False)
+        
+        # Create data loaders
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        
+        return train_loader, val_loader
+    
+    def train_model(self, train_loader, val_loader, num_epochs=15, learning_rate=0.001):
+        """Train the model (similar structure to your evaluation loop)"""
+        print("Starting YangMi transfer learning training...")
+        
+        # Setup training components
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), 
+                             lr=learning_rate, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.7)
+        
+        # Training history (similar to your results tracking)
+        history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': []
+        }
+        
+        best_val_acc = 0.0
+        
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            print("-" * 50)
+            
+            # Training phase
+            self.model.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            
+            for images, labels in tqdm(train_loader, desc="Training"):
+                try:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    
+                    # Skip problematic batches
+                    if torch.any(torch.isnan(images)) or images.size(0) == 0:
+                        continue
+                    
+                    optimizer.zero_grad()
+                    outputs = self.model(images)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    optimizer.step()
+                    
+                    # Statistics
+                    train_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    train_total += labels.size(0)
+                    train_correct += (predicted == labels).sum().item()
+                    
+                except Exception as e:
+                    if "out of memory" in str(e):
+                        print("GPU memory issue, skipping batch")
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                        continue
+                    else:
+                        print(f"Training error: {e}")
+                        continue
+            
+            # Validation phase (similar to your evaluation approach)
+            self.model.eval()
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
+            
+            with torch.no_grad():
+                for images, labels in tqdm(val_loader, desc="Validation"):
+                    try:
+                        images, labels = images.to(self.device), labels.to(self.device)
+                        
+                        if torch.any(torch.isnan(images)) or images.size(0) == 0:
+                            continue
+                        
+                        outputs = self.model(images)
+                        loss = criterion(outputs, labels)
+                        
+                        val_loss += loss.item()
+                        _, predicted = torch.max(outputs.data, 1)
+                        val_total += labels.size(0)
+                        val_correct += (predicted == labels).sum().item()
+                        
+                    except Exception as e:
+                        print(f"Validation error: {e}")
+                        continue
+            
+            # Calculate metrics
+            train_acc = 100 * train_correct / train_total if train_total > 0 else 0
+            val_acc = 100 * val_correct / val_total if val_total > 0 else 0
+            
+            # Store history
+            history['train_loss'].append(train_loss / max(len(train_loader), 1))
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_loss / max(len(val_loader), 1))
+            history['val_acc'].append(val_acc)
+            
+            # Print results (similar to your reporting style)
+            print(f"Train Loss: {train_loss/max(len(train_loader), 1):.4f}, Train Acc: {train_acc:.2f}%")
+            print(f"Val Loss: {val_loss/max(len(val_loader), 1):.4f}, Val Acc: {val_acc:.2f}%")
+            
+            # Save best model
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                self.save_model('best_yangmi_transfer_model.pth')
+                print(f"✓ New best model saved! Val Acc: {val_acc:.2f}%")
+            
+            scheduler.step()
+        
+        print(f"\nTraining completed! Best validation accuracy: {best_val_acc:.2f}%")
+        return history
+    
+    def extract_features(self, image_path):
+        """Extract features from trained model (similar to your extract_features)"""
+        try:
+            # Load and process image
+            image = cv2.imread(image_path)
+            if image is None:
+                return None
+            
+            # Convert BGR to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Create temporary dataset for processing
+            temp_dataset = YangMiFaceDataset([image_path], [0], is_training=False)
+            face_tensor, _ = temp_dataset[0]
+            
+            if torch.sum(face_tensor) == 0:  # Check if valid
+                return None
+            
+            # Extract features
+            self.model.eval()
+            with torch.no_grad():
+                face_tensor = face_tensor.unsqueeze(0).to(self.device)
+                
+                # Get features from second-to-last layer
+                features = self.model.avgpool(self.model.layer4(
+                    self.model.layer3(self.model.layer2(self.model.layer1(
+                        self.model.maxpool(self.model.relu(self.model.bn1(self.model.conv1(face_tensor))))
+                    )))
+                ))
+                features = torch.flatten(features, 1)
+                
+                # Normalize features (similar to your approach)
+                features = features / torch.norm(features, dim=1, keepdim=True)
+                
+            return features.cpu().numpy().flatten()
+            
+        except Exception as e:
+            print(f"Error extracting features from {image_path}: {e}")
+            return None
+    
+    def evaluate_on_test(self, test_dir, threshold=0.5):
+        """Evaluate trained model on test images (similar to your evaluation approach)"""
+        print(f"Evaluating on test images from {test_dir}")
+        
+        # Get test images
         image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
-        image_files = []
+        test_files = []
         for ext in image_extensions:
-            image_files.extend(glob(os.path.join(test_dir, ext)))
-            image_files.extend(glob(os.path.join(test_dir, ext.upper())))
+            test_files.extend(glob(os.path.join(test_dir, ext)))
+            test_files.extend(glob(os.path.join(test_dir, ext.upper())))
         
-        test_features = []
-        test_paths = []
+        if len(test_files) == 0:
+            print(f"No test images found in {test_dir}")
+            return []
         
-        for img_path in tqdm(image_files, desc="Processing test images"):
-            feature = self.extract_features(img_path)
-            if feature is not None:
-                test_features.append(feature)
-                test_paths.append(img_path)
+        print(f"Found {len(test_files)} test images")
         
-        if len(test_features) == 0:
-            raise ValueError("No valid test images found!")
-            
-        return np.array(test_features), test_paths
-    
-    def compute_similarities(self, gallery_features, test_features):
-        """Compute cosine similarities between test and gallery images"""
-        return cosine_similarity(test_features, gallery_features)
-    
-    def evaluate_performance(self, similarities, test_paths, gallery_paths, threshold=0.5):
-        """Evaluate recognition performance"""
+        # Evaluate each image
         results = []
+        self.model.eval()
         
-        for i, test_path in enumerate(test_paths):
-            # Find most similar gallery image
-            max_sim_idx = np.argmax(similarities[i])
-            max_similarity = similarities[i][max_sim_idx]
-            best_match = gallery_paths[max_sim_idx]
-            
-            # Simple evaluation: if similarity > threshold, consider it a match
-            is_match = max_similarity > threshold
-            
-            results.append({
-                'test_image': os.path.basename(test_path),
-                'best_match': os.path.basename(best_match),
-                'similarity': max_similarity,
-                'is_match': is_match,
-                'test_path': test_path,
-                'match_path': best_match
-            })
+        with torch.no_grad():
+            for img_path in tqdm(test_files, desc="Processing test images"):
+                try:
+                    # Load and process image
+                    temp_dataset = YangMiFaceDataset([img_path], [0], is_training=False)
+                    face_tensor, _ = temp_dataset[0]
+                    
+                    if torch.sum(face_tensor) == 0:
+                        continue
+                    
+                    face_tensor = face_tensor.unsqueeze(0).to(self.device)
+                    
+                    # Get prediction
+                    outputs = self.model(face_tensor)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    _, predicted = torch.max(outputs, 1)
+                    
+                    # Store result (similar to your results format)
+                    yangmi_prob = probabilities[0][1].cpu().item()
+                    is_yangmi = predicted.cpu().item() == 1
+                    confidence = max(probabilities[0]).cpu().item()
+                    
+                    results.append({
+                        'test_image': os.path.basename(img_path),
+                        'yangmi_probability': yangmi_prob,
+                        'is_yangmi': is_yangmi,
+                        'confidence': confidence,
+                        'similarity': yangmi_prob,  # For compatibility with your analysis
+                        'is_match': yangmi_prob > threshold,
+                        'test_path': img_path
+                    })
+                    
+                except Exception as e:
+                    print(f"Error processing {img_path}: {e}")
+                    continue
         
         return results
     
-    def create_results_report(self, results, gallery_features, test_features, output_dir='results'):
-        """Create detailed results report and comprehensive analysis"""
+    def create_results_report(self, results, output_dir='results'):
+        """Create comprehensive analysis report (inspired by your reporting style)"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Convert to DataFrame for analysis
+        if len(results) == 0:
+            print("No results to analyze")
+            return
+        
+        # Convert to DataFrame
         df = pd.DataFrame(results)
         
-        # Generate comprehensive analysis
-        analysis_report = self.generate_comprehensive_analysis(df, gallery_features, test_features)
+        # Generate analysis (similar to your comprehensive analysis)
+        analysis_report = self.generate_transfer_learning_analysis(df)
         
-        # Save analysis to file
-        analysis_path = os.path.join(output_dir, 'comprehensive_analysis.txt')
+        # Save analysis
+        analysis_path = os.path.join(output_dir, 'transfer_learning_analysis.txt')
         with open(analysis_path, 'w') as f:
             f.write(analysis_report)
         
-        # Print analysis to console
         print(analysis_report)
         
         # Save detailed results
-        df.to_csv(os.path.join(output_dir, 'detailed_results.csv'), index=False)
+        df.to_csv(os.path.join(output_dir, 'transfer_learning_results.csv'), index=False)
         
-        # Save summary statistics as JSON
-        import json
-        summary_stats = self.calculate_summary_statistics(df, gallery_features, test_features)
-        with open(os.path.join(output_dir, 'summary_statistics.json'), 'w') as f:
-            json.dump(summary_stats, f, indent=2)
-        
-        # Plot similarity distribution
-        plt.figure(figsize=(10, 6))
-        plt.hist(df['similarity'], bins=30, alpha=0.7, edgecolor='black')
-        plt.axvline(x=0.5, color='red', linestyle='--', label='Threshold (0.5)')
-        plt.xlabel('Cosine Similarity')
-        plt.ylabel('Frequency')
-        plt.title('Distribution of Similarities - YangMi AdaFace Test')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(output_dir, 'similarity_distribution.png'), dpi=300, bbox_inches='tight')
-        plt.show()
+        # Plot results (similar to your plotting)
+        self.plot_results(df, output_dir)
         
         return df
     
-    def calculate_summary_statistics(self, df, gallery_features, test_features):
-        """Calculate comprehensive summary statistics"""
-        similarities = df['similarity'].values
-        
-        stats = {
-            'dataset_info': {
-                'total_gallery_images': len(gallery_features),
-                'total_test_images': len(test_features),
-                'successfully_processed_test_images': len(df)
-            },
-            'similarity_statistics': {
-                'mean_similarity': float(np.mean(similarities)),
-                'median_similarity': float(np.median(similarities)),
-                'std_similarity': float(np.std(similarities)),
-                'min_similarity': float(np.min(similarities)),
-                'max_similarity': float(np.max(similarities)),
-                'q25_similarity': float(np.percentile(similarities, 25)),
-                'q75_similarity': float(np.percentile(similarities, 75))
-            },
-            'threshold_analysis': {
-                'threshold_0.3': int((similarities > 0.3).sum()),
-                'threshold_0.4': int((similarities > 0.4).sum()),
-                'threshold_0.5': int((similarities > 0.5).sum()),
-                'threshold_0.6': int((similarities > 0.6).sum()),
-                'threshold_0.7': int((similarities > 0.7).sum()),
-                'threshold_0.8': int((similarities > 0.8).sum()),
-                'threshold_0.9': int((similarities > 0.9).sum())
-            },
-            'performance_metrics': {
-                'accuracy_at_0.5': float((similarities > 0.5).sum() / len(similarities)),
-                'accuracy_at_0.6': float((similarities > 0.6).sum() / len(similarities)),
-                'accuracy_at_0.7': float((similarities > 0.7).sum() / len(similarities))
-            }
-        }
-        
-        return stats
-    
-    def generate_comprehensive_analysis(self, df, gallery_features, test_features):
-        """Generate comprehensive analysis report"""
-        similarities = df['similarity'].values
+    def generate_transfer_learning_analysis(self, df):
+        """Generate analysis report (inspired by your comprehensive analysis)"""
+        similarities = df['yangmi_probability'].values
         
         report = []
         report.append("=" * 80)
-        report.append("ADAFACE YANGMI DATASET COMPREHENSIVE ANALYSIS REPORT")
+        report.append("YANGMI TRANSFER LEARNING COMPREHENSIVE ANALYSIS REPORT")
         report.append("=" * 80)
         report.append(f"Generated on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append(f"Model: Transfer Learning with {self.model_name}")
         report.append("")
         
         # Dataset Overview
-        report.append("1. DATASET OVERVIEW")
+        report.append("1. EVALUATION OVERVIEW")
         report.append("-" * 40)
-        report.append(f"Gallery Images (Training): {len(gallery_features)}")
-        report.append(f"Test Images: {len(test_features)}")
-        report.append(f"Successfully Processed Test Images: {len(df)}")
-        report.append(f"Processing Success Rate: {len(df)/len(test_features)*100:.1f}%")
+        report.append(f"Test Images Processed: {len(df)}")
+        report.append(f"Images Classified as YangMi: {sum(df['is_yangmi'])}")
+        report.append(f"Average Confidence: {np.mean(df['confidence']):.4f}")
         report.append("")
         
-        # Similarity Statistics
-        report.append("2. SIMILARITY DISTRIBUTION ANALYSIS")
+        # Performance Analysis (similar to your threshold analysis)
+        report.append("2. PROBABILITY DISTRIBUTION ANALYSIS")
         report.append("-" * 40)
-        report.append(f"Mean Similarity: {np.mean(similarities):.4f}")
-        report.append(f"Median Similarity: {np.median(similarities):.4f}")
+        report.append(f"Mean YangMi Probability: {np.mean(similarities):.4f}")
+        report.append(f"Median YangMi Probability: {np.median(similarities):.4f}")
         report.append(f"Standard Deviation: {np.std(similarities):.4f}")
-        report.append(f"Minimum Similarity: {np.min(similarities):.4f}")
-        report.append(f"Maximum Similarity: {np.max(similarities):.4f}")
-        report.append(f"25th Percentile: {np.percentile(similarities, 25):.4f}")
-        report.append(f"75th Percentile: {np.percentile(similarities, 75):.4f}")
+        report.append(f"Min Probability: {np.min(similarities):.4f}")
+        report.append(f"Max Probability: {np.max(similarities):.4f}")
         report.append("")
         
-        # Threshold Analysis
+        # Threshold Analysis (like your original)
         report.append("3. THRESHOLD PERFORMANCE ANALYSIS")
         report.append("-" * 40)
         thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
         for thresh in thresholds:
             count = (similarities > thresh).sum()
             percentage = count / len(similarities) * 100
-            report.append(f"Threshold {thresh}: {count}/{len(similarities)} ({percentage:.1f}%)")
-        report.append("")
-        
-        # Performance Interpretation
-        report.append("4. PERFORMANCE INTERPRETATION")
-        report.append("-" * 40)
-        avg_sim = np.mean(similarities)
-        if avg_sim > 0.8:
-            performance = "EXCELLENT"
-            interpretation = "AdaFace shows exceptional performance on YangMi dataset"
-        elif avg_sim > 0.7:
-            performance = "VERY GOOD"
-            interpretation = "AdaFace shows very good performance on YangMi dataset"
-        elif avg_sim > 0.6:
-            performance = "GOOD"
-            interpretation = "AdaFace shows good performance on YangMi dataset"
-        elif avg_sim > 0.5:
-            performance = "MODERATE"
-            interpretation = "AdaFace shows moderate performance on YangMi dataset"
-        else:
-            performance = "POOR"
-            interpretation = "AdaFace shows poor performance on YangMi dataset"
-        
-        report.append(f"Overall Performance: {performance}")
-        report.append(f"Interpretation: {interpretation}")
-        report.append("")
-        
-        # Top and Bottom Performers
-        report.append("5. TOP AND BOTTOM PERFORMING MATCHES")
-        report.append("-" * 40)
-        report.append("TOP 5 MATCHES:")
-        top_5 = df.nlargest(5, 'similarity')[['test_image', 'best_match', 'similarity']]
-        for idx, row in top_5.iterrows():
-            report.append(f"  {row['test_image']} → {row['best_match']} (sim: {row['similarity']:.4f})")
-        
-        report.append("\nBOTTOM 5 MATCHES:")
-        bottom_5 = df.nsmallest(5, 'similarity')[['test_image', 'best_match', 'similarity']]
-        for idx, row in bottom_5.iterrows():
-            report.append(f"  {row['test_image']} → {row['best_match']} (sim: {row['similarity']:.4f})")
-        report.append("")
-        
-        # Quality Assessment
-        report.append("6. QUALITY ASSESSMENT")
-        report.append("-" * 40)
-        high_quality = (similarities > 0.8).sum()
-        medium_quality = ((similarities > 0.6) & (similarities <= 0.8)).sum()
-        low_quality = (similarities <= 0.6).sum()
-        
-        report.append(f"High Quality Matches (>0.8): {high_quality} ({high_quality/len(similarities)*100:.1f}%)")
-        report.append(f"Medium Quality Matches (0.6-0.8): {medium_quality} ({medium_quality/len(similarities)*100:.1f}%)")
-        report.append(f"Low Quality Matches (≤0.6): {low_quality} ({low_quality/len(similarities)*100:.1f}%)")
-        report.append("")
-        
-        # Recommendations
-        report.append("7. RECOMMENDATIONS")
-        report.append("-" * 40)
-        if avg_sim > 0.7:
-            report.append("✓ Model performs well on this dataset")
-            report.append("✓ Consider using threshold 0.6-0.7 for practical applications")
-        else:
-            report.append("⚠ Consider collecting more diverse training images")
-            report.append("⚠ Check image quality and lighting conditions")
-            report.append("⚠ Consider fine-tuning the model on this specific dataset")
-        
-        if high_quality < len(similarities) * 0.5:
-            report.append("⚠ Less than 50% high-quality matches - investigate data quality")
-        
-        report.append("")
-        report.append("8. FILES GENERATED")
-        report.append("-" * 40)
-        report.append("- comprehensive_analysis.txt (this file)")
-        report.append("- detailed_results.csv (all similarity scores)")
-        report.append("- summary_statistics.json (machine-readable stats)")
-        report.append("- similarity_distribution.png (histogram)")
-        report.append("- top_matches_visualization.png (visual matches)")
-        report.append("")
-        report.append("=" * 80)
-        
-        return "\n".join(report)
-    
-    def visualize_matches(self, results, output_dir='results', top_n=5):
-        """Visualize top matches"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Sort by similarity
-        sorted_results = sorted(results, key=lambda x: x['similarity'], reverse=True)
-        
-        fig, axes = plt.subplots(top_n, 2, figsize=(12, 4*top_n))
-        fig.suptitle('Top AdaFace Matches - YangMi Dataset', fontsize=16)
-        
-        for i in range(min(top_n, len(sorted_results))):
-            result = sorted_results[i]
-            
-            # Load and display test image
-            test_img = cv2.imread(result['test_path'])
-            test_img = cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB)
-            axes[i, 0].imshow(test_img)
-            axes[i, 0].set_title(f"Test: {result['test_image']}")
-            axes[i, 0].axis('off')
-            
-            # Load and display best match
-            match_img = cv2.imread(result['match_path'])
-            match_img = cv2.cvtColor(match_img, cv2.COLOR_BGR2RGB)
-            axes[i, 1].imshow(match_img)
-            axes[i, 1].set_title(f"Match: {result['best_match']}\nSimilarity: {result['similarity']:.4f}")
-            axes[i, 1].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'top_matches_visualization.png'), dpi=300, bbox_inches='tight')
-        plt.show()
-
-def main():
-    # Initialize tester with best pretrained model
-    tester = AdaFaceYangMiTester(model_name='ir_100')  # Use the best model
-    
-    # Set paths
-    gallery_dir = 'elifiles/images/yangmi'  # Training images
-    test_dir = 'elifiles/images/yangmi_test'  # Test images
-    
-    print("Starting YangMi AdaFace evaluation...")
-    
-    try:
-        # Process gallery (training) images
-        gallery_features, gallery_paths = tester.process_gallery_images(gallery_dir)
-        print(f"Gallery processed: {len(gallery_features)} valid images")
-        
-        # Process test images
-        test_features, test_paths = tester.process_test_images(test_dir)
-        print(f"Test set processed: {len(test_features)} valid images")
-        
-        # Compute similarities
-        print("Computing similarities...")
-        similarities = tester.compute_similarities(gallery_features, test_features)
-        
-        # Evaluate performance
-        print("Evaluating performance...")
-        results = tester.evaluate_performance(similarities, test_paths, gallery_paths, threshold=0.5)
-        
-        # Create results report
-        df = tester.create_results_report(results, gallery_features, test_features)
-        
-        # Visualize top matches
-        tester.visualize_matches(results, top_n=5)
-        
-        print(f"\nResults saved to 'results/' directory")
-        print("Check 'detailed_results.csv' for full analysis")
-        
-    except Exception as e:
-        print(f"Error during evaluation: {str(e)}")
-        print("Make sure you have:")
-        print("1. Downloaded a pretrained AdaFace model")
-        print("2. Images in the specified directories")
-        print("3. All dependencies installed")
-
-if __name__ == "__main__":
-    main()
+            report.append(f

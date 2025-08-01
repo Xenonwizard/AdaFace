@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from torchvision.models import resnet50
 import os
 import cv2
 import numpy as np
@@ -12,277 +11,301 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
 import json
 import warnings
 warnings.filterwarnings('ignore')
 
-class FaceDataset(Dataset):
-    """Custom dataset for face images - Python 3.8 compatible"""
-    def __init__(self, image_paths, labels, img_size=224):
+# AdaFace specific imports (you'll need these files from the AdaFace repo)
+import sys
+sys.path.append('.')  # Assuming AdaFace files are in current directory
+
+# You'll need to download these from https://github.com/mk-minchul/AdaFace
+try:
+    import net  # AdaFace network architecture
+    from head import AdaFace as AdaFaceHead  # AdaFace loss head
+    from face_alignment import align  # MTCNN face alignment
+except ImportError:
+    print("ERROR: AdaFace modules not found!")
+    print("Please download the following files from https://github.com/mk-minchul/AdaFace:")
+    print("- net.py")
+    print("- head.py") 
+    print("- face_alignment/")
+    print("- pretrained/ (with adaface_ir50_ms1mv2.ckpt)")
+    exit(1)
+
+class AdaFaceYangMiDataset(Dataset):
+    """Dataset for AdaFace fine-tuning with proper MTCNN alignment"""
+    
+    def __init__(self, image_paths, labels, is_training=True):
         self.image_paths = image_paths
         self.labels = labels
-        self.img_size = img_size
+        self.is_training = is_training
         
-        # Initialize face cascade - handle potential path issues on Ubuntu 14
-        cascade_path = self._find_cascade_file()
-        if cascade_path:
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        # AdaFace specific preprocessing (BGR, 112x112, mean=0.5, std=0.5)
+        if is_training:
+            self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+            ])
         else:
-            print("Warning: Face cascade not found, using center crop")
-            self.face_cascade = None
-        
-        # Define transforms
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-    def _find_cascade_file(self):
-        """Find the face cascade file - compatible with older OpenCV versions"""
-        possible_paths = [
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
-            '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
-            '/usr/local/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
-            './haarcascade_frontalface_default.xml'
-        ]
-        
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        return None
-        
+            self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.ToTensor(),
+            ])
+    
+    def to_adaface_input(self, pil_rgb_image):
+        """Convert PIL RGB image to AdaFace input format (BGR, normalized)"""
+        # Convert PIL to numpy
+        np_img = np.array(pil_rgb_image)
+        # Convert RGB to BGR and normalize to [-1, 1]
+        bgr_img = ((np_img[:,:,::-1] / 255.) - 0.5) / 0.5
+        # Convert to tensor and add batch dimension
+        tensor = torch.tensor([bgr_img.transpose(2,0,1)]).float()
+        return tensor.squeeze(0)  # Remove batch dimension for dataset
+    
     def __len__(self):
         return len(self.image_paths)
-    
-    def detect_and_crop_face(self, image):
-        """Simple face detection and cropping"""
-        if self.face_cascade is None:
-            # Fallback to center crop
-            h, w = image.shape[:2]
-            size = min(h, w)
-            y = (h - size) // 2
-            x = (w - size) // 2
-            return image[y:y+size, x:x+size]
-        
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
-            
-            if len(faces) > 0:
-                # Use the largest face
-                largest_face = max(faces, key=lambda x: x[2] * x[3])
-                x, y, w, h = largest_face
-                
-                # Add padding
-                padding = int(0.2 * min(w, h))
-                x = max(0, x - padding)
-                y = max(0, y - padding)
-                w = min(image.shape[1] - x, w + 2 * padding)
-                h = min(image.shape[0] - y, h + 2 * padding)
-                
-                face = image[y:y+h, x:x+w]
-                return face
-            else:
-                # Fallback to center crop
-                h, w = image.shape[:2]
-                size = min(h, w)
-                y = (h - size) // 2
-                x = (w - size) // 2
-                return image[y:y+size, x:x+size]
-        except Exception as e:
-            print(f"Face detection error: {e}")
-            # Fallback to center crop
-            h, w = image.shape[:2]
-            size = min(h, w)
-            y = (h - size) // 2
-            x = (w - size) // 2
-            return image[y:y+size, x:x+size]
     
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         label = self.labels[idx]
         
         try:
-            # Load image
-            image = cv2.imread(img_path)
-            if image is None:
-                # Return dummy tensor
-                return torch.zeros(3, self.img_size, self.img_size), label
+            # Use AdaFace's MTCNN alignment (much better than OpenCV)
+            try:
+                aligned_rgb_img = align.get_aligned_face(img_path)
+                if aligned_rgb_img is None:
+                    raise Exception("MTCNN failed")
+            except:
+                # Fallback: manual preprocessing
+                image = cv2.imread(img_path)
+                if image is None:
+                    return torch.zeros(3, 112, 112), label
+                
+                # Convert BGR to RGB
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                # Resize to 112x112 (AdaFace standard)
+                aligned_rgb_img = cv2.resize(image, (112, 112))
+                # Convert to PIL
+                from PIL import Image
+                aligned_rgb_img = Image.fromarray(aligned_rgb_img)
             
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # Apply transforms if training
+            if self.is_training:
+                aligned_rgb_img = self.transform(aligned_rgb_img)
+                # Convert tensor back to PIL for AdaFace processing
+                if isinstance(aligned_rgb_img, torch.Tensor):
+                    aligned_rgb_img = transforms.ToPILImage()(aligned_rgb_img)
             
-            # Detect and crop face
-            face = self.detect_and_crop_face(image)
+            # Convert to AdaFace input format
+            adaface_input = self.to_adaface_input(aligned_rgb_img)
             
-            # Apply transforms
-            face = self.transform(face)
-            
-            return face, label
+            return adaface_input, label
             
         except Exception as e:
-            print(f"Error loading {img_path}: {e}")
-            return torch.zeros(3, self.img_size, self.img_size), label
+            print(f"Error processing {img_path}: {e}")
+            return torch.zeros(3, 112, 112), label
 
-class YangMiTransferLearner:
-    """Transfer learning using ResNet50 - Python 3.8 compatible"""
-    def __init__(self, num_classes=2, img_size=224):
-        self.num_classes = num_classes
-        self.img_size = img_size
+class AdaFaceYangMiFinetuner:
+    """Fine-tune AdaFace pretrained model for YangMi recognition"""
+    
+    def __init__(self, architecture='ir_50', pretrained_path='pretrained/adaface_ir50_ms1mv2.ckpt'):
+        print(f"Initializing AdaFace fine-tuner with {architecture}")
+        self.architecture = architecture
+        self.pretrained_path = pretrained_path
         
-        # Check PyTorch version compatibility
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"Python version: 3.8.18")
+        # Load pretrained AdaFace model
+        self.load_pretrained_model()
         
-        # Load pretrained ResNet50 - compatible with older PyTorch versions
-        print("Loading pretrained ResNet50...")
-        try:
-            # For PyTorch 1.x
-            self.model = resnet50(pretrained=True)
-        except TypeError:
-            # For newer PyTorch versions that might be installed
-            from torchvision.models import ResNet50_Weights
-            self.model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-        
-        # Freeze backbone layers
-        self.freeze_backbone()
-        
-        # Modify classifier
-        self.modify_classifier()
-        
-        # Move to GPU if available
+        # Setup device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
-        # Handle potential CUDA compatibility issues on older systems
-        if self.device.type == 'cuda':
-            try:
-                self.model.to(self.device)
-                # Test CUDA with a small tensor
-                test_tensor = torch.randn(1, 3, 224, 224).to(self.device)
-                _ = self.model(test_tensor)
-                print("CUDA test successful")
-            except Exception as e:
-                print(f"CUDA error: {e}")
-                print("Falling back to CPU")
-                self.device = torch.device('cpu')
-                self.model.to(self.device)
+        # Move model to device
+        self.backbone.to(self.device)
+        
+        # We'll create a new classification head for YangMi vs Others
+        self.setup_classification_head()
+        
+        print("AdaFace fine-tuner initialized successfully!")
+    
+    def load_pretrained_model(self):
+        """Load pretrained AdaFace backbone"""
+        print(f"Loading pretrained AdaFace model from {self.pretrained_path}")
+        
+        if not os.path.exists(self.pretrained_path):
+            raise FileNotFoundError(f"Pretrained model not found: {self.pretrained_path}")
+        
+        # Build AdaFace network
+        self.backbone = net.build_model(self.architecture)
+        
+        # Load pretrained weights
+        checkpoint = torch.load(self.pretrained_path, map_location='cpu')
+        
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            # Remove 'model.' prefix if present
+            model_state_dict = {key.replace('model.', ''): val for key, val in state_dict.items() if key.startswith('model.')}
         else:
-            self.model.to(self.device)
+            model_state_dict = checkpoint
         
-    def freeze_backbone(self):
-        """Freeze early layers of ResNet50"""
-        print("Freezing backbone layers...")
+        # Load weights
+        self.backbone.load_state_dict(model_state_dict, strict=False)
+        print("✓ Pretrained AdaFace weights loaded successfully")
+    
+    def setup_classification_head(self):
+        """Setup classification head for YangMi recognition"""
+        # Get feature dimension from backbone
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 112, 112)
+            if self.device.type == 'cuda':
+                dummy_input = dummy_input.to(self.device)
+                features, _ = self.backbone(dummy_input)
+            else:
+                features, _ = self.backbone(dummy_input)
+            feature_dim = features.shape[1]
         
-        # Freeze all layers except the last few
-        for name, param in self.model.named_parameters():
-            if 'layer4' not in name and 'fc' not in name:
+        print(f"AdaFace feature dimension: {feature_dim}")
+        
+        # Create classification head for binary classification
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(feature_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256), 
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 2)  # YangMi vs Others
+        ).to(self.device)
+        
+        print("✓ Classification head created")
+    
+    def freeze_backbone_layers(self, freeze_ratio=0.7):
+        """Freeze early layers of the backbone for fine-tuning"""
+        print(f"Freezing {freeze_ratio*100}% of backbone layers...")
+        
+        # Get all backbone parameters
+        backbone_params = list(self.backbone.named_parameters())
+        num_layers = len(backbone_params)
+        freeze_until = int(num_layers * freeze_ratio)
+        
+        # Freeze early layers
+        for i, (name, param) in enumerate(backbone_params):
+            if i < freeze_until:
                 param.requires_grad = False
             else:
                 param.requires_grad = True
         
-        # Count parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # Count trainable parameters
+        backbone_trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        classifier_trainable = sum(p.numel() for p in self.classifier.parameters())
+        total_trainable = backbone_trainable + classifier_trainable
         
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
-        
-    def modify_classifier(self):
-        """Replace the final fully connected layer"""
-        # Get the number of features from the last layer
-        num_features = self.model.fc.in_features
-        
-        # Replace with custom classifier
-        self.model.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(num_features, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, self.num_classes)
-        )
-        
-        print(f"Modified classifier for {self.num_classes} classes")
+        print(f"Trainable parameters:")
+        print(f"  Backbone: {backbone_trainable:,}")
+        print(f"  Classifier: {classifier_trainable:,}")
+        print(f"  Total: {total_trainable:,}")
     
-    def prepare_data(self, positive_dir, negative_dir=None, test_size=0.2, batch_size=8):
-        """Prepare training data - reduced batch size for stability"""
-        print("Preparing dataset...")
+    def prepare_training_data(self, gallery_dir, negative_dir=None, test_size=0.2, batch_size=16):
+        """Prepare training data for AdaFace fine-tuning"""
+        print("Preparing AdaFace training dataset...")
         
-        image_paths = []
-        labels = []
+        # Get positive samples (YangMi)
+        positive_files = self._get_image_files(gallery_dir)
+        print(f"Found {len(positive_files)} YangMi images")
         
-        # Get positive images (YangMi = 1)
-        extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.JPG', '*.JPEG', '*.PNG', '*.BMP']
-        pos_files = []
-        for ext in extensions:
-            pos_files.extend(glob(os.path.join(positive_dir, ext)))
-        
-        if len(pos_files) == 0:
-            raise ValueError(f"No images found in {positive_dir}")
-        
-        image_paths.extend(pos_files)
-        labels.extend([1] * len(pos_files))
-        
-        # Get negative images if provided
+        # Get negative samples
         if negative_dir and os.path.exists(negative_dir):
-            neg_files = []
-            for ext in extensions:
-                neg_files.extend(glob(os.path.join(negative_dir, ext)))
-            
-            if len(neg_files) > 0:
-                image_paths.extend(neg_files)
-                labels.extend([0] * len(neg_files))
-            else:
-                print(f"Warning: No negative images found in {negative_dir}")
+            negative_files = self._get_image_files(negative_dir)
+            print(f"Found {len(negative_files)} negative images")
+        else:
+            print("No negative directory provided")
+            negative_files = []
         
-        # If we don't have negative samples, create some by duplicating positives
-        if labels.count(0) == 0:
-            print("Creating synthetic negative samples...")
-            # Duplicate some positive samples as negatives (they'll be augmented differently)
-            synthetic_negatives = pos_files[:len(pos_files)//2]  # Use half as negatives
-            image_paths.extend(synthetic_negatives)
-            labels.extend([0] * len(synthetic_negatives))
+        # Create balanced dataset
+        if len(negative_files) == 0:
+            # Use some positives as negatives with heavy augmentation
+            negative_files = positive_files[:len(positive_files)//2]
+            print(f"Using {len(negative_files)} augmented positives as negatives")
         
-        print(f"Total images: {len(image_paths)}")
-        print(f"Positive images: {labels.count(1)}")
-        print(f"Negative images: {labels.count(0)}")
+        # Balance the dataset
+        min_samples = min(len(positive_files), len(negative_files))
+        positive_files = positive_files[:min_samples]
+        negative_files = negative_files[:min_samples]
+        
+        # Combine data
+        all_files = positive_files + negative_files
+        all_labels = [1] * len(positive_files) + [0] * len(negative_files)
+        
+        print(f"Balanced dataset:")
+        print(f"  Positive samples: {len(positive_files)}")
+        print(f"  Negative samples: {len(negative_files)}")
+        print(f"  Total samples: {len(all_files)}")
         
         # Split into train/validation
-        train_paths, val_paths, train_labels, val_labels = train_test_split(
-            image_paths, labels, test_size=test_size, random_state=42, 
-            stratify=labels
+        train_files, val_files, train_labels, val_labels = train_test_split(
+            all_files, all_labels, 
+            test_size=test_size, 
+            random_state=42, 
+            stratify=all_labels
         )
         
         # Create datasets
-        train_dataset = FaceDataset(train_paths, train_labels, img_size=self.img_size)
-        val_dataset = FaceDataset(val_paths, val_labels, img_size=self.img_size)
+        train_dataset = AdaFaceYangMiDataset(train_files, train_labels, is_training=True)
+        val_dataset = AdaFaceYangMiDataset(val_files, val_labels, is_training=False)
         
-        # Create data loaders with reduced batch size and fewer workers for stability
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                                num_workers=0, pin_memory=False)  # num_workers=0 for compatibility
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
-                               num_workers=0, pin_memory=False)
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=2,
+            pin_memory=True if self.device.type == 'cuda' else False
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=2,
+            pin_memory=True if self.device.type == 'cuda' else False
+        )
         
         return train_loader, val_loader
     
-    def train_model(self, train_loader, val_loader, num_epochs=10, learning_rate=0.001):
-        """Train the model with error handling"""
-        print("Starting transfer learning training...")
+    def _get_image_files(self, directory):
+        """Get all image files from directory"""
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+        image_files = []
+        for ext in image_extensions:
+            image_files.extend(glob(os.path.join(directory, ext)))
+            image_files.extend(glob(os.path.join(directory, ext.upper())))
+        return image_files
+    
+    def train_model(self, train_loader, val_loader, num_epochs=20, learning_rate=0.0001):
+        """Fine-tune AdaFace model"""
+        print("Starting AdaFace fine-tuning...")
         
-        # Setup optimizer with error handling
-        try:
-            optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), 
-                                 lr=learning_rate, weight_decay=1e-4)
-        except Exception as e:
-            print(f"Optimizer error: {e}")
-            # Fallback to SGD
-            optimizer = optim.SGD(filter(lambda p: p.requires_grad, self.model.parameters()), 
-                                lr=learning_rate, weight_decay=1e-4, momentum=0.9)
+        # Freeze backbone layers
+        self.freeze_backbone_layers(freeze_ratio=0.8)
         
+        # Setup optimizer with different learning rates
+        backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
+        classifier_params = list(self.classifier.parameters())
+        
+        optimizer = optim.Adam([
+            {'params': backbone_params, 'lr': learning_rate * 0.1},  # Lower LR for backbone
+            {'params': classifier_params, 'lr': learning_rate}       # Higher LR for classifier
+        ], weight_decay=1e-4)
+        
+        # Loss function and scheduler
         criterion = nn.CrossEntropyLoss()
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.5)
         
         # Training history
         history = {
@@ -299,13 +322,15 @@ class YangMiTransferLearner:
             print("-" * 50)
             
             # Training phase
-            self.model.train()
+            self.backbone.train()
+            self.classifier.train()
+            
             train_loss = 0.0
             train_correct = 0
             train_total = 0
             
-            try:
-                for batch_idx, (images, labels) in enumerate(tqdm(train_loader, desc="Training")):
+            for images, labels in tqdm(train_loader, desc="Training"):
+                try:
                     images, labels = images.to(self.device), labels.to(self.device)
                     
                     # Skip problematic batches
@@ -314,50 +339,62 @@ class YangMiTransferLearner:
                     
                     optimizer.zero_grad()
                     
-                    try:
-                        outputs = self.model(images)
-                        loss = criterion(outputs, labels)
-                        loss.backward()
-                        
-                        # Gradient clipping for stability
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        
-                        optimizer.step()
-                        
-                        # Statistics
-                        train_loss += loss.item()
-                        _, predicted = torch.max(outputs.data, 1)
-                        train_total += labels.size(0)
-                        train_correct += (predicted == labels).sum().item()
-                        
-                    except RuntimeError as e:
-                        if "out of memory" in str(e):
-                            print("GPU out of memory, skipping batch")
-                            if hasattr(torch.cuda, 'empty_cache'):
-                                torch.cuda.empty_cache()
-                            continue
-                        else:
-                            raise e
-                
-            except Exception as e:
-                print(f"Training error: {e}")
-                continue
+                    # Forward pass through AdaFace backbone
+                    features, norms = self.backbone(images)
+                    
+                    # Forward pass through classifier
+                    outputs = self.classifier(features)
+                    
+                    # Compute loss
+                    loss = criterion(outputs, labels)
+                    
+                    # Backward pass
+                    loss.backward()
+                    
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.backbone.parameters()) + list(self.classifier.parameters()), 
+                        max_norm=1.0
+                    )
+                    
+                    optimizer.step()
+                    
+                    # Statistics
+                    train_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    train_total += labels.size(0)
+                    train_correct += (predicted == labels).sum().item()
+                    
+                except Exception as e:
+                    if "out of memory" in str(e):
+                        print("GPU memory issue, skipping batch")
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                        continue
+                    else:
+                        print(f"Training error: {e}")
+                        continue
             
             # Validation phase
-            self.model.eval()
+            self.backbone.eval()
+            self.classifier.eval()
+            
             val_loss = 0.0
             val_correct = 0
             val_total = 0
             
             with torch.no_grad():
-                try:
-                    for images, labels in tqdm(val_loader, desc="Validation"):
+                for images, labels in tqdm(val_loader, desc="Validation"):
+                    try:
                         images, labels = images.to(self.device), labels.to(self.device)
                         
                         if torch.any(torch.isnan(images)) or images.size(0) == 0:
                             continue
                         
-                        outputs = self.model(images)
+                        # Forward pass
+                        features, norms = self.backbone(images)
+                        outputs = self.classifier(features)
+                        
                         loss = criterion(outputs, labels)
                         
                         val_loss += loss.item()
@@ -365,170 +402,212 @@ class YangMiTransferLearner:
                         val_total += labels.size(0)
                         val_correct += (predicted == labels).sum().item()
                         
-                except Exception as e:
-                    print(f"Validation error: {e}")
+                    except Exception as e:
+                        print(f"Validation error: {e}")
+                        continue
             
             # Calculate metrics
             train_acc = 100 * train_correct / train_total if train_total > 0 else 0
             val_acc = 100 * val_correct / val_total if val_total > 0 else 0
             
             # Store history
-            if len(train_loader) > 0:
-                history['train_loss'].append(train_loss / len(train_loader))
-            else:
-                history['train_loss'].append(0)
-            history['train_acc'].append(train_acc)
+            train_loss_avg = train_loss / max(len(train_loader), 1)
+            val_loss_avg = val_loss / max(len(val_loader), 1)
             
-            if len(val_loader) > 0:
-                history['val_loss'].append(val_loss / len(val_loader))
-            else:
-                history['val_loss'].append(0)
+            history['train_loss'].append(train_loss_avg)
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_loss_avg)
             history['val_acc'].append(val_acc)
             
             # Print results
-            print(f"Train Loss: {train_loss/max(len(train_loader), 1):.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"Val Loss: {val_loss/max(len(val_loader), 1):.4f}, Val Acc: {val_acc:.2f}%")
+            print(f"Train Loss: {train_loss_avg:.4f}, Train Acc: {train_acc:.2f}%")
+            print(f"Val Loss: {val_loss_avg:.4f}, Val Acc: {val_acc:.2f}%")
             
             # Save best model
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                try:
-                    self.save_model('best_yangmi_resnet_model.pth')
-                    print(f"New best model saved! Val Acc: {val_acc:.2f}%")
-                except Exception as e:
-                    print(f"Error saving model: {e}")
+                self.save_model('best_adaface_yangmi_model.pth')
+                print(f"✓ New best model saved! Val Acc: {val_acc:.2f}%")
             
-            try:
-                scheduler.step()
-            except Exception as e:
-                print(f"Scheduler error: {e}")
+            scheduler.step()
         
-        print(f"\nTraining completed! Best validation accuracy: {best_val_acc:.2f}%")
+        print(f"\nFine-tuning completed! Best validation accuracy: {best_val_acc:.2f}%")
         return history
     
+    def extract_features(self, image_path):
+        """Extract AdaFace features from image"""
+        try:
+            # Use AdaFace preprocessing
+            try:
+                aligned_rgb_img = align.get_aligned_face(image_path)
+                if aligned_rgb_img is None:
+                    raise Exception("MTCNN failed")
+            except:
+                # Fallback preprocessing
+                image = cv2.imread(image_path)
+                if image is None:
+                    return None
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                aligned_rgb_img = cv2.resize(image, (112, 112))
+                from PIL import Image
+                aligned_rgb_img = Image.fromarray(aligned_rgb_img)
+            
+            # Convert to AdaFace input
+            dataset = AdaFaceYangMiDataset([image_path], [0], is_training=False)
+            adaface_input, _ = dataset[0]
+            
+            # Extract features
+            self.backbone.eval()
+            with torch.no_grad():
+                adaface_input = adaface_input.unsqueeze(0).to(self.device)
+                features, norms = self.backbone(adaface_input)
+                
+                # Normalize features
+                features = features / torch.norm(features, dim=1, keepdim=True)
+                
+            return features.cpu().numpy().flatten()
+            
+        except Exception as e:
+            print(f"Error extracting features from {image_path}: {e}")
+            return None
+    
+    def evaluate_on_test(self, test_dir, threshold=0.5):
+        """Evaluate fine-tuned AdaFace model on test images"""
+        print(f"Evaluating fine-tuned AdaFace on test images from {test_dir}")
+        
+        # Get test images
+        test_files = self._get_image_files(test_dir)
+        
+        if len(test_files) == 0:
+            print(f"No test images found in {test_dir}")
+            return []
+        
+        print(f"Found {len(test_files)} test images")
+        
+        # Evaluate each image
+        results = []
+        self.backbone.eval()
+        self.classifier.eval()
+        
+        with torch.no_grad():
+            for img_path in tqdm(test_files, desc="Processing test images"):
+                try:
+                    # Load and process image
+                    temp_dataset = AdaFaceYangMiDataset([img_path], [0], is_training=False)
+                    adaface_input, _ = temp_dataset[0]
+                    
+                    if torch.sum(adaface_input) == 0:
+                        continue
+                    
+                    adaface_input = adaface_input.unsqueeze(0).to(self.device)
+                    
+                    # Get AdaFace features
+                    features, norms = self.backbone(adaface_input)
+                    
+                    # Get classification prediction
+                    outputs = self.classifier(features)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    _, predicted = torch.max(outputs, 1)
+                    
+                    # Store result
+                    yangmi_prob = probabilities[0][1].cpu().item()
+                    is_yangmi = predicted.cpu().item() == 1
+                    confidence = max(probabilities[0]).cpu().item()
+                    feature_norm = norms[0].cpu().item()
+                    
+                    results.append({
+                        'test_image': os.path.basename(img_path),
+                        'yangmi_probability': yangmi_prob,
+                        'is_yangmi': is_yangmi,
+                        'confidence': confidence,
+                        'feature_norm': feature_norm,  # AdaFace quality indicator
+                        'similarity': yangmi_prob,
+                        'is_match': yangmi_prob > threshold,
+                        'test_path': img_path
+                    })
+                    
+                except Exception as e:
+                    print(f"Error processing {img_path}: {e}")
+                    continue
+        
+        return results
+    
     def save_model(self, filepath):
-        """Save the trained model with error handling"""
+        """Save fine-tuned AdaFace model"""
         try:
             torch.save({
-                'model_state_dict': self.model.state_dict(),
-                'num_classes': self.num_classes,
-                'img_size': self.img_size
+                'backbone_state_dict': self.backbone.state_dict(),
+                'classifier_state_dict': self.classifier.state_dict(),
+                'architecture': self.architecture
             }, filepath)
             print(f"Model saved to {filepath}")
         except Exception as e:
             print(f"Error saving model: {e}")
     
     def load_model(self, filepath):
-        """Load a trained model"""
+        """Load fine-tuned AdaFace model"""
         try:
             checkpoint = torch.load(filepath, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.num_classes = checkpoint['num_classes']
-            self.img_size = checkpoint['img_size']
-            print(f"Model loaded from {filepath}")
+            self.backbone.load_state_dict(checkpoint['backbone_state_dict'])
+            self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+            print(f"Fine-tuned model loaded from {filepath}")
         except Exception as e:
             print(f"Error loading model: {e}")
-    
-    def plot_training_history(self, history, save_path='training_history.png'):
-        """Plot training history with error handling"""
-        try:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-            
-            # Plot loss
-            if len(history['train_loss']) > 0:
-                ax1.plot(history['train_loss'], label='Train Loss', marker='o')
-                ax1.plot(history['val_loss'], label='Validation Loss', marker='s')
-                ax1.set_title('Model Loss')
-                ax1.set_xlabel('Epoch')
-                ax1.set_ylabel('Loss')
-                ax1.legend()
-                ax1.grid(True)
-            
-            # Plot accuracy
-            if len(history['train_acc']) > 0:
-                ax2.plot(history['train_acc'], label='Train Accuracy', marker='o')
-                ax2.plot(history['val_acc'], label='Validation Accuracy', marker='s')
-                ax2.set_title('Model Accuracy')
-                ax2.set_xlabel('Epoch')
-                ax2.set_ylabel('Accuracy (%)')
-                ax2.legend()
-                ax2.grid(True)
-            
-            plt.tight_layout()
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            plt.show()
-            print(f"Training history plot saved to {save_path}")
-            
-        except Exception as e:
-            print(f"Error plotting history: {e}")
 
 def main():
-    """Main training function with comprehensive error handling"""
-    print("=== YangMi Transfer Learning (Python 3.8 Compatible) ===")
-    print(f"Python: 3.8.18, Ubuntu 14")
+    """Main function for AdaFace fine-tuning"""
+    print("=== AdaFace Fine-tuning for YangMi Recognition ===")
     
-    # Check dependencies
-    try:
-        import torch
-        import torchvision
-        import cv2
-        import sklearn
-        print("✓ All required packages available")
-    except ImportError as e:
-        print(f"✗ Missing package: {e}")
-        print("Install with: pip install torch torchvision opencv-python scikit-learn matplotlib pandas tqdm")
-        return
+    # Initialize fine-tuner
+    finetuner = AdaFaceYangMiFinetuner(
+        architecture='ir_50',
+        pretrained_path='pretrained/adaface_ir50_ms1mv2.ckpt'
+    )
     
-    # Initialize transfer learner
-    try:
-        learner = YangMiTransferLearner(num_classes=2, img_size=224)
-    except Exception as e:
-        print(f"Error initializing learner: {e}")
-        return
-    
-    # Set your data paths
-    positive_dir = 'elifiles/images/yangmi'      # Your YangMi images
-    negative_dir = 'elifiles/images/others'      # Other people's images (optional)
-    test_dir = 'elifiles/images/yangmi_test'     # Test images
-    
-    # Check if directories exist
-    if not os.path.exists(positive_dir):
-        print(f"Error: Directory {positive_dir} not found")
-        print("Please create this directory and add YangMi images")
-        return
+    # Set paths
+    gallery_dir = 'elifiles/images/yangmi'        # YangMi training images
+    negative_dir = 'elifiles/images/others'       # Other people's images
+    test_dir = 'elifiles/images/yangmi_test'      # Test images
     
     try:
-        # Prepare data
-        print("\n=== Preparing Data ===")
-        train_loader, val_loader = learner.prepare_data(positive_dir, negative_dir, batch_size=4)
+        print("\n=== Preparing Training Data ===")
+        train_loader, val_loader = finetuner.prepare_training_data(
+            gallery_dir, negative_dir, batch_size=8
+        )
         
-        # Train model
-        print("\n=== Training Model ===")
-        history = learner.train_model(train_loader, val_loader, num_epochs=10, learning_rate=0.001)
+        print("\n=== Fine-tuning AdaFace Model ===")
+        history = finetuner.train_model(train_loader, val_loader, num_epochs=15)
         
-        # Plot training history
-        print("\n=== Plotting Results ===")
-        learner.plot_training_history(history)
-        
-        # Evaluate on test set if available
+        # Test the fine-tuned model
         if os.path.exists(test_dir):
-            print("\n=== Evaluating on Test Set ===")
-            # This would require implementing evaluate_on_test method
-            print(f"Test directory found: {test_dir}")
-            print("Test evaluation can be added if needed")
+            print("\n=== Evaluating Fine-tuned AdaFace Model ===")
+            results = finetuner.evaluate_on_test(test_dir)
+            
+            if results:
+                print(f"Test evaluation completed: {len(results)} images processed")
+                
+                # Create results report
+                df = pd.DataFrame(results)
+                df.to_csv('adaface_finetuning_results.csv', index=False)
+                
+                # Summary statistics
+                yangmi_detected = sum(1 for r in results if r['is_yangmi'])
+                avg_prob = np.mean([r['yangmi_probability'] for r in results])
+                avg_conf = np.mean([r['confidence'] for r in results])
+                avg_norm = np.mean([r['feature_norm'] for r in results])
+                
+                print(f"\n=== FINAL RESULTS SUMMARY ===")
+                print(f"Images classified as YangMi: {yangmi_detected}/{len(results)}")
+                print(f"Average YangMi probability: {avg_prob:.4f}")
+                print(f"Average confidence: {avg_conf:.4f}")
+                print(f"Average feature norm: {avg_norm:.4f}")
+                print(f"Results saved to 'adaface_finetuning_results.csv'")
         
-        print("\n=== Training Complete ===")
-        print("Check for saved model: best_yangmi_resnet_model.pth")
+        print("\n=== Fine-tuning Complete ===")
+        print("Check 'best_adaface_yangmi_model.pth' for the trained model")
         
     except Exception as e:
-        print(f"Error during training: {e}")
-        import traceback
-        traceback.print_exc()
-        print("\nTroubleshooting tips:")
-        print("1. Reduce batch_size if out of memory")
-        print("2. Check image file formats and paths")
-        print("3. Ensure sufficient disk space")
-        print("4. Try running on CPU if GPU issues")
+        print(f"Error during fine-tuning: {e}")
 
 if __name__ == "__main__":
     main()
