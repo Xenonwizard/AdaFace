@@ -183,8 +183,9 @@ class AdaFaceYangMiMultiEthnicTrainer:
     def setup_classification_head(self):
         """Setup classification head for YangMi vs Others"""
         # Get feature dimension from backbone
+        self.backbone.eval()  # Set to eval mode to avoid BatchNorm issues
         with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 112, 112)
+            dummy_input = torch.randn(2, 3, 112, 112)  # Use batch size of 2 instead of 1
             if self.device.type == 'cuda':
                 dummy_input = dummy_input.to(self.device)
             
@@ -202,14 +203,13 @@ class AdaFaceYangMiMultiEthnicTrainer:
         print(f"AdaFace feature dimension: {feature_dim}")
         
         # Create classification head for binary classification (YangMi vs Others)
+        # Use simpler architecture to avoid BatchNorm issues with small batches
         self.classifier = nn.Sequential(
             nn.Dropout(0.4),
             nn.Linear(feature_dim, 512),
-            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256), 
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 2)  # YangMi (1) vs Others (0)
