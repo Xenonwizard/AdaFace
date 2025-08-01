@@ -43,20 +43,8 @@ class AdaFaceMultiEthnicDataset(Dataset):
         self.ethnic_groups = ethnic_groups
         self.is_training = is_training
         
-        # AdaFace specific preprocessing (BGR, 112x112, mean=0.5, std=0.5)
-        if is_training:
-            self.transform = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                transforms.RandomRotation(degrees=3),
-                transforms.ToTensor(),
-            ])
-        else:
-            self.transform = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.ToTensor(),
-            ])
+        # We'll handle transforms manually in __getitem__ to avoid PIL/Tensor conflicts
+        print(f"Dataset initialized with {len(image_paths)} images, training mode: {is_training}")
     
     def to_adaface_input(self, pil_rgb_image):
         """Convert PIL RGB image to AdaFace input format (BGR, normalized)"""
@@ -114,15 +102,30 @@ class AdaFaceMultiEthnicDataset(Dataset):
             if aligned_rgb_img is None:
                 return torch.zeros(3, 112, 112), label, ethnic_group
             
-            # Apply transforms if training
+            # Convert to tensor first, then apply transforms
+            if not isinstance(aligned_rgb_img, torch.Tensor):
+                # Convert PIL to tensor
+                aligned_tensor = transforms.ToTensor()(aligned_rgb_img)
+            else:
+                aligned_tensor = aligned_rgb_img
+            
+            # Apply training transforms if needed
             if self.is_training:
-                aligned_rgb_img = self.transform(aligned_rgb_img)
-                # Convert tensor back to PIL for AdaFace processing
-                if isinstance(aligned_rgb_img, torch.Tensor):
-                    aligned_rgb_img = transforms.ToPILImage()(aligned_rgb_img)
+                # Apply transforms that work on tensors
+                if torch.rand(1) > 0.5:  # Random horizontal flip
+                    aligned_tensor = torch.flip(aligned_tensor, [2])
+                
+                # Color jitter simulation (simple brightness/contrast)
+                if torch.rand(1) > 0.5:
+                    brightness_factor = 0.8 + torch.rand(1) * 0.4  # 0.8 to 1.2
+                    aligned_tensor = aligned_tensor * brightness_factor
+                    aligned_tensor = torch.clamp(aligned_tensor, 0, 1)
+            
+            # Convert tensor back to PIL for AdaFace input conversion
+            aligned_pil = transforms.ToPILImage()(aligned_tensor)
             
             # Convert to AdaFace input format
-            adaface_input = self.to_adaface_input(aligned_rgb_img)
+            adaface_input = self.to_adaface_input(aligned_pil)
             
             return adaface_input, label, ethnic_group
             
