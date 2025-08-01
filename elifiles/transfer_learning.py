@@ -16,30 +16,31 @@ import json
 import warnings
 warnings.filterwarnings('ignore')
 
-# AdaFace specific imports (you'll need these files from the AdaFace repo)
-import sys
-sys.path.append('.')  # Assuming AdaFace files are in current directory
-
-# You'll need to download these from https://github.com/mk-minchul/AdaFace
+# AdaFace specific imports
 try:
     import net  # AdaFace network architecture
     from head import AdaFace as AdaFaceHead  # AdaFace loss head
-    from face_alignment import align  # MTCNN face alignment
-except ImportError:
-    print("ERROR: AdaFace modules not found!")
-    print("Please download the following files from https://github.com/mk-minchul/AdaFace:")
-    print("- net.py")
-    print("- head.py") 
-    print("- face_alignment/")
-    print("- pretrained/ (with adaface_ir50_ms1mv2.ckpt)")
+    print("✓ AdaFace core modules imported successfully")
+except ImportError as e:
+    print(f"ERROR importing AdaFace modules: {e}")
     exit(1)
 
-class AdaFaceYangMiDataset(Dataset):
-    """Dataset for AdaFace fine-tuning with proper MTCNN alignment"""
+# Try to import face alignment
+try:
+    from face_alignment import align  # MTCNN face alignment
+    MTCNN_AVAILABLE = True
+    print("✓ MTCNN face alignment available")
+except ImportError as e:
+    print(f"Warning: MTCNN not available ({e}), will use fallback alignment")
+    MTCNN_AVAILABLE = False
+
+class AdaFaceMultiEthnicDataset(Dataset):
+    """Dataset for AdaFace training with multi-ethnic negative samples"""
     
-    def __init__(self, image_paths, labels, is_training=True):
+    def __init__(self, image_paths, labels, ethnic_groups, is_training=True):
         self.image_paths = image_paths
         self.labels = labels
+        self.ethnic_groups = ethnic_groups
         self.is_training = is_training
         
         # AdaFace specific preprocessing (BGR, 112x112, mean=0.5, std=0.5)
@@ -47,7 +48,8 @@ class AdaFaceYangMiDataset(Dataset):
             self.transform = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+                transforms.RandomRotation(degrees=3),
                 transforms.ToTensor(),
             ])
         else:
@@ -58,13 +60,36 @@ class AdaFaceYangMiDataset(Dataset):
     
     def to_adaface_input(self, pil_rgb_image):
         """Convert PIL RGB image to AdaFace input format (BGR, normalized)"""
-        # Convert PIL to numpy
         np_img = np.array(pil_rgb_image)
-        # Convert RGB to BGR and normalize to [-1, 1]
         bgr_img = ((np_img[:,:,::-1] / 255.) - 0.5) / 0.5
-        # Convert to tensor and add batch dimension
-        tensor = torch.tensor([bgr_img.transpose(2,0,1)]).float()
-        return tensor.squeeze(0)  # Remove batch dimension for dataset
+        tensor = torch.tensor(bgr_img.transpose(2,0,1)).float()
+        return tensor
+    
+    def fallback_alignment(self, image_path):
+        """Fallback face alignment when MTCNN is not available"""
+        try:
+            image = cv2.imread(image_path)
+            if image is None:
+                return None
+            
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Simple center crop and resize to 112x112
+            h, w = image.shape[:2]
+            size = min(h, w)
+            y = (h - size) // 2
+            x = (w - size) // 2
+            cropped = image[y:y+size, x:x+size]
+            
+            # Resize to AdaFace standard size
+            aligned = cv2.resize(cropped, (112, 112))
+            
+            from PIL import Image
+            return Image.fromarray(aligned)
+            
+        except Exception as e:
+            print(f"Fallback alignment error for {image_path}: {e}")
+            return None
     
     def __len__(self):
         return len(self.image_paths)
@@ -72,26 +97,22 @@ class AdaFaceYangMiDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         label = self.labels[idx]
+        ethnic_group = self.ethnic_groups[idx]
         
         try:
-            # Use AdaFace's MTCNN alignment (much better than OpenCV)
-            try:
-                aligned_rgb_img = align.get_aligned_face(img_path)
-                if aligned_rgb_img is None:
-                    raise Exception("MTCNN failed")
-            except:
-                # Fallback: manual preprocessing
-                image = cv2.imread(img_path)
-                if image is None:
-                    return torch.zeros(3, 112, 112), label
-                
-                # Convert BGR to RGB
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                # Resize to 112x112 (AdaFace standard)
-                aligned_rgb_img = cv2.resize(image, (112, 112))
-                # Convert to PIL
-                from PIL import Image
-                aligned_rgb_img = Image.fromarray(aligned_rgb_img)
+            # Try MTCNN alignment first
+            if MTCNN_AVAILABLE:
+                try:
+                    aligned_rgb_img = align.get_aligned_face(img_path)
+                    if aligned_rgb_img is None:
+                        raise Exception("MTCNN failed")
+                except:
+                    aligned_rgb_img = self.fallback_alignment(img_path)
+            else:
+                aligned_rgb_img = self.fallback_alignment(img_path)
+            
+            if aligned_rgb_img is None:
+                return torch.zeros(3, 112, 112), label, ethnic_group
             
             # Apply transforms if training
             if self.is_training:
@@ -103,17 +124,17 @@ class AdaFaceYangMiDataset(Dataset):
             # Convert to AdaFace input format
             adaface_input = self.to_adaface_input(aligned_rgb_img)
             
-            return adaface_input, label
+            return adaface_input, label, ethnic_group
             
         except Exception as e:
             print(f"Error processing {img_path}: {e}")
-            return torch.zeros(3, 112, 112), label
+            return torch.zeros(3, 112, 112), label, ethnic_group
 
-class AdaFaceYangMiFinetuner:
-    """Fine-tune AdaFace pretrained model for YangMi recognition"""
+class AdaFaceYangMiMultiEthnicTrainer:
+    """Train AdaFace for YangMi recognition with multi-ethnic negative samples"""
     
     def __init__(self, architecture='ir_50', pretrained_path='pretrained/adaface_ir50_ms1mv2.ckpt'):
-        print(f"Initializing AdaFace fine-tuner with {architecture}")
+        print(f"Initializing AdaFace multi-ethnic trainer with {architecture}")
         self.architecture = architecture
         self.pretrained_path = pretrained_path
         
@@ -127,16 +148,19 @@ class AdaFaceYangMiFinetuner:
         # Move model to device
         self.backbone.to(self.device)
         
-        # We'll create a new classification head for YangMi vs Others
+        # Setup classification head
         self.setup_classification_head()
         
-        print("AdaFace fine-tuner initialized successfully!")
+        print("AdaFace multi-ethnic trainer initialized successfully!")
     
     def load_pretrained_model(self):
         """Load pretrained AdaFace backbone"""
         print(f"Loading pretrained AdaFace model from {self.pretrained_path}")
         
         if not os.path.exists(self.pretrained_path):
+            print(f"Available models in pretrained/:")
+            for f in os.listdir('pretrained/'):
+                print(f"  - {f}")
             raise FileNotFoundError(f"Pretrained model not found: {self.pretrained_path}")
         
         # Build AdaFace network
@@ -147,30 +171,37 @@ class AdaFaceYangMiFinetuner:
         
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
-            # Remove 'model.' prefix if present
-            model_state_dict = {key.replace('model.', ''): val for key, val in state_dict.items() if key.startswith('model.')}
+            model_state_dict = {key.replace('model.', '') if key.startswith('model.') else key: val 
+                              for key, val in state_dict.items() if 'model.' in key or not key.startswith('head.')}
         else:
             model_state_dict = checkpoint
         
-        # Load weights
-        self.backbone.load_state_dict(model_state_dict, strict=False)
-        print("✓ Pretrained AdaFace weights loaded successfully")
+        # Load weights (ignore missing keys from head)
+        missing_keys, unexpected_keys = self.backbone.load_state_dict(model_state_dict, strict=False)
+        print(f"✓ Pretrained AdaFace weights loaded (missing: {len(missing_keys)}, unexpected: {len(unexpected_keys)})")
     
     def setup_classification_head(self):
-        """Setup classification head for YangMi recognition"""
+        """Setup classification head for YangMi vs Others"""
         # Get feature dimension from backbone
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 112, 112)
             if self.device.type == 'cuda':
                 dummy_input = dummy_input.to(self.device)
+            
+            try:
                 features, _ = self.backbone(dummy_input)
-            else:
-                features, _ = self.backbone(dummy_input)
-            feature_dim = features.shape[1]
+                feature_dim = features.shape[1]
+            except:
+                backbone_output = self.backbone(dummy_input)
+                if isinstance(backbone_output, tuple):
+                    features = backbone_output[0]
+                else:
+                    features = backbone_output
+                feature_dim = features.shape[1]
         
         print(f"AdaFace feature dimension: {feature_dim}")
         
-        # Create classification head for binary classification
+        # Create classification head for binary classification (YangMi vs Others)
         self.classifier = nn.Sequential(
             nn.Dropout(0.4),
             nn.Linear(feature_dim, 512),
@@ -181,21 +212,120 @@ class AdaFaceYangMiFinetuner:
             nn.BatchNorm1d(256), 
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 2)  # YangMi vs Others
+            nn.Linear(256, 2)  # YangMi (1) vs Others (0)
         ).to(self.device)
         
-        print("✓ Classification head created")
+        print("✓ Classification head created for YangMi vs Others")
     
-    def freeze_backbone_layers(self, freeze_ratio=0.7):
+    def prepare_multiethnic_data(self, yangmi_dir, ethnic_dirs, test_size=0.2, batch_size=16):
+        """Prepare training data with YangMi and multi-ethnic negative samples"""
+        print("Preparing multi-ethnic training dataset...")
+        
+        all_files = []
+        all_labels = []
+        all_ethnic_groups = []
+        
+        # Get YangMi images (positive samples)
+        yangmi_files = self._get_image_files(yangmi_dir)
+        print(f"Found {len(yangmi_files)} YangMi images")
+        
+        all_files.extend(yangmi_files)
+        all_labels.extend([1] * len(yangmi_files))  # Label 1 for YangMi
+        all_ethnic_groups.extend(['yangmi'] * len(yangmi_files))
+        
+        # Get negative samples from each ethnic group
+        total_negatives = 0
+        for ethnic_name, ethnic_dir in ethnic_dirs.items():
+            if os.path.exists(ethnic_dir):
+                ethnic_files = self._get_image_files(ethnic_dir)
+                print(f"Found {len(ethnic_files)} {ethnic_name} images")
+                
+                all_files.extend(ethnic_files)
+                all_labels.extend([0] * len(ethnic_files))  # Label 0 for others
+                all_ethnic_groups.extend([ethnic_name] * len(ethnic_files))
+                total_negatives += len(ethnic_files)
+            else:
+                print(f"Warning: {ethnic_name} directory not found: {ethnic_dir}")
+        
+        print(f"\nDataset composition:")
+        print(f"  YangMi (positive): {len(yangmi_files)}")
+        print(f"  Others (negative): {total_negatives}")
+        print(f"  Total samples: {len(all_files)}")
+        
+        # Balance the dataset if needed
+        if total_negatives > len(yangmi_files) * 2:
+            print("Balancing dataset by reducing negative samples...")
+            # Keep all YangMi images but limit negatives
+            max_negatives = len(yangmi_files) * 2
+            
+            # Randomly sample negatives while maintaining ethnic diversity
+            negative_indices = [i for i, label in enumerate(all_labels) if label == 0]
+            selected_negatives = np.random.choice(negative_indices, min(max_negatives, len(negative_indices)), replace=False)
+            
+            # Keep all positives and selected negatives
+            positive_indices = [i for i, label in enumerate(all_labels) if label == 1]
+            keep_indices = list(positive_indices) + list(selected_negatives)
+            
+            all_files = [all_files[i] for i in keep_indices]
+            all_labels = [all_labels[i] for i in keep_indices]
+            all_ethnic_groups = [all_ethnic_groups[i] for i in keep_indices]
+            
+            print(f"Balanced dataset: {len(all_files)} total samples")
+        
+        # Split into train/validation with stratification
+        train_files, val_files, train_labels, val_labels, train_ethnic, val_ethnic = train_test_split(
+            all_files, all_labels, all_ethnic_groups,
+            test_size=test_size, 
+            random_state=42, 
+            stratify=all_labels
+        )
+        
+        print(f"\nTrain/Val split:")
+        print(f"  Training samples: {len(train_files)} (YangMi: {sum(train_labels)}, Others: {len(train_labels) - sum(train_labels)})")
+        print(f"  Validation samples: {len(val_files)} (YangMi: {sum(val_labels)}, Others: {len(val_labels) - sum(val_labels)})")
+        
+        # Create datasets
+        train_dataset = AdaFaceMultiEthnicDataset(train_files, train_labels, train_ethnic, is_training=True)
+        val_dataset = AdaFaceMultiEthnicDataset(val_files, val_labels, val_ethnic, is_training=False)
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=0,
+            pin_memory=True if self.device.type == 'cuda' else False
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=0,
+            pin_memory=True if self.device.type == 'cuda' else False
+        )
+        
+        return train_loader, val_loader
+    
+    def _get_image_files(self, directory):
+        """Get all image files from directory"""
+        if not os.path.exists(directory):
+            return []
+            
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+        image_files = []
+        for ext in image_extensions:
+            image_files.extend(glob(os.path.join(directory, ext)))
+            image_files.extend(glob(os.path.join(directory, ext.upper())))
+        return image_files
+    
+    def freeze_backbone_layers(self, freeze_ratio=0.8):
         """Freeze early layers of the backbone for fine-tuning"""
         print(f"Freezing {freeze_ratio*100}% of backbone layers...")
         
-        # Get all backbone parameters
         backbone_params = list(self.backbone.named_parameters())
         num_layers = len(backbone_params)
         freeze_until = int(num_layers * freeze_ratio)
         
-        # Freeze early layers
         for i, (name, param) in enumerate(backbone_params):
             if i < freeze_until:
                 param.requires_grad = False
@@ -212,84 +342,9 @@ class AdaFaceYangMiFinetuner:
         print(f"  Classifier: {classifier_trainable:,}")
         print(f"  Total: {total_trainable:,}")
     
-    def prepare_training_data(self, gallery_dir, negative_dir=None, test_size=0.2, batch_size=16):
-        """Prepare training data for AdaFace fine-tuning"""
-        print("Preparing AdaFace training dataset...")
-        
-        # Get positive samples (YangMi)
-        positive_files = self._get_image_files(gallery_dir)
-        print(f"Found {len(positive_files)} YangMi images")
-        
-        # Get negative samples
-        if negative_dir and os.path.exists(negative_dir):
-            negative_files = self._get_image_files(negative_dir)
-            print(f"Found {len(negative_files)} negative images")
-        else:
-            print("No negative directory provided")
-            negative_files = []
-        
-        # Create balanced dataset
-        if len(negative_files) == 0:
-            # Use some positives as negatives with heavy augmentation
-            negative_files = positive_files[:len(positive_files)//2]
-            print(f"Using {len(negative_files)} augmented positives as negatives")
-        
-        # Balance the dataset
-        min_samples = min(len(positive_files), len(negative_files))
-        positive_files = positive_files[:min_samples]
-        negative_files = negative_files[:min_samples]
-        
-        # Combine data
-        all_files = positive_files + negative_files
-        all_labels = [1] * len(positive_files) + [0] * len(negative_files)
-        
-        print(f"Balanced dataset:")
-        print(f"  Positive samples: {len(positive_files)}")
-        print(f"  Negative samples: {len(negative_files)}")
-        print(f"  Total samples: {len(all_files)}")
-        
-        # Split into train/validation
-        train_files, val_files, train_labels, val_labels = train_test_split(
-            all_files, all_labels, 
-            test_size=test_size, 
-            random_state=42, 
-            stratify=all_labels
-        )
-        
-        # Create datasets
-        train_dataset = AdaFaceYangMiDataset(train_files, train_labels, is_training=True)
-        val_dataset = AdaFaceYangMiDataset(val_files, val_labels, is_training=False)
-        
-        # Create data loaders
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
-            num_workers=2,
-            pin_memory=True if self.device.type == 'cuda' else False
-        )
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size, 
-            shuffle=False, 
-            num_workers=2,
-            pin_memory=True if self.device.type == 'cuda' else False
-        )
-        
-        return train_loader, val_loader
-    
-    def _get_image_files(self, directory):
-        """Get all image files from directory"""
-        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
-        image_files = []
-        for ext in image_extensions:
-            image_files.extend(glob(os.path.join(directory, ext)))
-            image_files.extend(glob(os.path.join(directory, ext.upper())))
-        return image_files
-    
     def train_model(self, train_loader, val_loader, num_epochs=20, learning_rate=0.0001):
-        """Fine-tune AdaFace model"""
-        print("Starting AdaFace fine-tuning...")
+        """Train AdaFace model with multi-ethnic data"""
+        print("Starting AdaFace multi-ethnic training...")
         
         # Freeze backbone layers
         self.freeze_backbone_layers(freeze_ratio=0.8)
@@ -303,7 +358,7 @@ class AdaFaceYangMiFinetuner:
             {'params': classifier_params, 'lr': learning_rate}       # Higher LR for classifier
         ], weight_decay=1e-4)
         
-        # Loss function and scheduler
+        # Loss function with class weighting for imbalanced data
         criterion = nn.CrossEntropyLoss()
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.5)
         
@@ -328,19 +383,30 @@ class AdaFaceYangMiFinetuner:
             train_loss = 0.0
             train_correct = 0
             train_total = 0
+            ethnic_stats = {}
             
-            for images, labels in tqdm(train_loader, desc="Training"):
+            for images, labels, ethnic_groups in tqdm(train_loader, desc="Training"):
                 try:
                     images, labels = images.to(self.device), labels.to(self.device)
                     
-                    # Skip problematic batches
                     if torch.any(torch.isnan(images)) or images.size(0) == 0:
                         continue
+                    
+                    # Track ethnic group statistics
+                    for ethnic in ethnic_groups:
+                        ethnic_stats[ethnic] = ethnic_stats.get(ethnic, 0) + 1
                     
                     optimizer.zero_grad()
                     
                     # Forward pass through AdaFace backbone
-                    features, norms = self.backbone(images)
+                    try:
+                        features, norms = self.backbone(images)
+                    except:
+                        backbone_output = self.backbone(images)
+                        if isinstance(backbone_output, tuple):
+                            features = backbone_output[0]
+                        else:
+                            features = backbone_output
                     
                     # Forward pass through classifier
                     outputs = self.classifier(features)
@@ -382,9 +448,10 @@ class AdaFaceYangMiFinetuner:
             val_loss = 0.0
             val_correct = 0
             val_total = 0
+            val_predictions = {'yangmi_correct': 0, 'others_correct': 0, 'yangmi_total': 0, 'others_total': 0}
             
             with torch.no_grad():
-                for images, labels in tqdm(val_loader, desc="Validation"):
+                for images, labels, ethnic_groups in tqdm(val_loader, desc="Validation"):
                     try:
                         images, labels = images.to(self.device), labels.to(self.device)
                         
@@ -392,15 +459,33 @@ class AdaFaceYangMiFinetuner:
                             continue
                         
                         # Forward pass
-                        features, norms = self.backbone(images)
-                        outputs = self.classifier(features)
+                        try:
+                            features, norms = self.backbone(images)
+                        except:
+                            backbone_output = self.backbone(images)
+                            if isinstance(backbone_output, tuple):
+                                features = backbone_output[0]
+                            else:
+                                features = backbone_output
                         
+                        outputs = self.classifier(features)
                         loss = criterion(outputs, labels)
                         
                         val_loss += loss.item()
                         _, predicted = torch.max(outputs.data, 1)
                         val_total += labels.size(0)
                         val_correct += (predicted == labels).sum().item()
+                        
+                        # Detailed accuracy by class
+                        for i in range(len(labels)):
+                            if labels[i] == 1:  # YangMi
+                                val_predictions['yangmi_total'] += 1
+                                if predicted[i] == 1:
+                                    val_predictions['yangmi_correct'] += 1
+                            else:  # Others
+                                val_predictions['others_total'] += 1
+                                if predicted[i] == 0:
+                                    val_predictions['others_correct'] += 1
                         
                     except Exception as e:
                         print(f"Validation error: {e}")
@@ -409,6 +494,10 @@ class AdaFaceYangMiFinetuner:
             # Calculate metrics
             train_acc = 100 * train_correct / train_total if train_total > 0 else 0
             val_acc = 100 * val_correct / val_total if val_total > 0 else 0
+            
+            # Detailed validation accuracy
+            yangmi_acc = 100 * val_predictions['yangmi_correct'] / max(val_predictions['yangmi_total'], 1)
+            others_acc = 100 * val_predictions['others_correct'] / max(val_predictions['others_total'], 1)
             
             # Store history
             train_loss_avg = train_loss / max(len(train_loader), 1)
@@ -422,69 +511,32 @@ class AdaFaceYangMiFinetuner:
             # Print results
             print(f"Train Loss: {train_loss_avg:.4f}, Train Acc: {train_acc:.2f}%")
             print(f"Val Loss: {val_loss_avg:.4f}, Val Acc: {val_acc:.2f}%")
+            print(f"  YangMi Acc: {yangmi_acc:.2f}% ({val_predictions['yangmi_correct']}/{val_predictions['yangmi_total']})")
+            print(f"  Others Acc: {others_acc:.2f}% ({val_predictions['others_correct']}/{val_predictions['others_total']})")
+            print(f"Training ethnic distribution: {ethnic_stats}")
             
             # Save best model
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                self.save_model('best_adaface_yangmi_model.pth')
+                self.save_model('best_adaface_yangmi_multiethnic.pth')
                 print(f"✓ New best model saved! Val Acc: {val_acc:.2f}%")
             
             scheduler.step()
         
-        print(f"\nFine-tuning completed! Best validation accuracy: {best_val_acc:.2f}%")
+        print(f"\nMulti-ethnic training completed! Best validation accuracy: {best_val_acc:.2f}%")
         return history
     
-    def extract_features(self, image_path):
-        """Extract AdaFace features from image"""
-        try:
-            # Use AdaFace preprocessing
-            try:
-                aligned_rgb_img = align.get_aligned_face(image_path)
-                if aligned_rgb_img is None:
-                    raise Exception("MTCNN failed")
-            except:
-                # Fallback preprocessing
-                image = cv2.imread(image_path)
-                if image is None:
-                    return None
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                aligned_rgb_img = cv2.resize(image, (112, 112))
-                from PIL import Image
-                aligned_rgb_img = Image.fromarray(aligned_rgb_img)
-            
-            # Convert to AdaFace input
-            dataset = AdaFaceYangMiDataset([image_path], [0], is_training=False)
-            adaface_input, _ = dataset[0]
-            
-            # Extract features
-            self.backbone.eval()
-            with torch.no_grad():
-                adaface_input = adaface_input.unsqueeze(0).to(self.device)
-                features, norms = self.backbone(adaface_input)
-                
-                # Normalize features
-                features = features / torch.norm(features, dim=1, keepdim=True)
-                
-            return features.cpu().numpy().flatten()
-            
-        except Exception as e:
-            print(f"Error extracting features from {image_path}: {e}")
-            return None
-    
     def evaluate_on_test(self, test_dir, threshold=0.5):
-        """Evaluate fine-tuned AdaFace model on test images"""
-        print(f"Evaluating fine-tuned AdaFace on test images from {test_dir}")
+        """Evaluate trained model on test images"""
+        print(f"Evaluating on test images from {test_dir}")
         
-        # Get test images
         test_files = self._get_image_files(test_dir)
-        
         if len(test_files) == 0:
             print(f"No test images found in {test_dir}")
             return []
         
         print(f"Found {len(test_files)} test images")
         
-        # Evaluate each image
         results = []
         self.backbone.eval()
         self.classifier.eval()
@@ -493,18 +545,26 @@ class AdaFaceYangMiFinetuner:
             for img_path in tqdm(test_files, desc="Processing test images"):
                 try:
                     # Load and process image
-                    temp_dataset = AdaFaceYangMiDataset([img_path], [0], is_training=False)
-                    adaface_input, _ = temp_dataset[0]
+                    temp_dataset = AdaFaceMultiEthnicDataset([img_path], [0], ['unknown'], is_training=False)
+                    adaface_input, _, _ = temp_dataset[0]
                     
                     if torch.sum(adaface_input) == 0:
                         continue
                     
                     adaface_input = adaface_input.unsqueeze(0).to(self.device)
                     
-                    # Get AdaFace features
-                    features, norms = self.backbone(adaface_input)
+                    # Get prediction
+                    try:
+                        features, norms = self.backbone(adaface_input)
+                        feature_norm = norms[0].cpu().item()
+                    except:
+                        backbone_output = self.backbone(adaface_input)
+                        if isinstance(backbone_output, tuple):
+                            features = backbone_output[0]
+                        else:
+                            features = backbone_output
+                        feature_norm = torch.norm(features).cpu().item()
                     
-                    # Get classification prediction
                     outputs = self.classifier(features)
                     probabilities = torch.softmax(outputs, dim=1)
                     _, predicted = torch.max(outputs, 1)
@@ -513,14 +573,13 @@ class AdaFaceYangMiFinetuner:
                     yangmi_prob = probabilities[0][1].cpu().item()
                     is_yangmi = predicted.cpu().item() == 1
                     confidence = max(probabilities[0]).cpu().item()
-                    feature_norm = norms[0].cpu().item()
                     
                     results.append({
                         'test_image': os.path.basename(img_path),
                         'yangmi_probability': yangmi_prob,
                         'is_yangmi': is_yangmi,
                         'confidence': confidence,
-                        'feature_norm': feature_norm,  # AdaFace quality indicator
+                        'feature_norm': feature_norm,
                         'similarity': yangmi_prob,
                         'is_match': yangmi_prob > threshold,
                         'test_path': img_path
@@ -533,7 +592,7 @@ class AdaFaceYangMiFinetuner:
         return results
     
     def save_model(self, filepath):
-        """Save fine-tuned AdaFace model"""
+        """Save trained AdaFace model"""
         try:
             torch.save({
                 'backbone_state_dict': self.backbone.state_dict(),
@@ -543,71 +602,163 @@ class AdaFaceYangMiFinetuner:
             print(f"Model saved to {filepath}")
         except Exception as e:
             print(f"Error saving model: {e}")
-    
-    def load_model(self, filepath):
-        """Load fine-tuned AdaFace model"""
-        try:
-            checkpoint = torch.load(filepath, map_location=self.device)
-            self.backbone.load_state_dict(checkpoint['backbone_state_dict'])
-            self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
-            print(f"Fine-tuned model loaded from {filepath}")
-        except Exception as e:
-            print(f"Error loading model: {e}")
 
 def main():
-    """Main function for AdaFace fine-tuning"""
-    print("=== AdaFace Fine-tuning for YangMi Recognition ===")
+    """Main function for AdaFace multi-ethnic training"""
+    print("=== AdaFace Multi-Ethnic Training for YangMi Recognition ===")
     
-    # Initialize fine-tuner
-    finetuner = AdaFaceYangMiFinetuner(
-        architecture='ir_50',
-        pretrained_path='pretrained/adaface_ir50_ms1mv2.ckpt'
-    )
+    # Define paths based on your EXACT directory structure
+    yangmi_dir = 'elifiles/images/celeb-dataset/chinese/yangmi'
     
-    # Set paths
-    gallery_dir = 'elifiles/images/yangmi'        # YangMi training images
-    negative_dir = 'elifiles/images/others'       # Other people's images
-    test_dir = 'elifiles/images/yangmi_test'      # Test images
+    # All the negative sample directories from your structure
+    ethnic_dirs = {
+        'caucasian_henrygolding': 'elifiles/images/celeb-dataset/caucasian/henrygolding',
+        'caucasian_urassayasperbund': 'elifiles/images/celeb-dataset/caucasian/urassayasperbund',
+        'chinese_gongli': 'elifiles/images/celeb-dataset/chinese/gongli',
+        'chinese_ronnychieng': 'elifiles/images/celeb-dataset/chinese/ronnychieng',
+        'indian_irrfankhan': 'elifiles/images/celeb-dataset/indian/irrfankhan',
+        'indian_priyankachopra': 'elifiles/images/celeb-dataset/indian/priyankachopra',
+        'malay_aaronaziz': 'elifiles/images/celeb-dataset/malay/aaronaziz',
+        'malay_sitinurhaliza': 'elifiles/images/celeb-dataset/malay/sitinurhaliza'
+    }
+    
+    # Test directories (if they exist)
+    test_dirs = [
+        'elifiles/images/celeb-dataset/chinese/yangmi_test',
+        'elifiles/images/celeb-dataset/caucasian/henrygolding_test',
+        'elifiles/images/celeb-dataset/caucasian/urassayasperbund_test',
+        'elifiles/images/celeb-dataset/chinese/gongli_test',
+        'elifiles/images/celeb-dataset/chinese/ronnychieng_test',
+        'elifiles/images/celeb-dataset/indian/irrfankhan_test', 
+        'elifiles/images/celeb-dataset/indian/priyankachopra_test',
+        'elifiles/images/celeb-dataset/malay/aaronaziz_test',
+        'elifiles/images/celeb-dataset/malay/sitinurhaliza_test'
+    ]
+    
+    # Check if YangMi directory exists
+    if not os.path.exists(yangmi_dir):
+        print(f"YangMi directory not found: {yangmi_dir}")
+        print("Please check your directory structure")
+        return
+    
+    # Show available directories
+    print("Dataset structure detected:")
+    print(f"✓ YangMi (target): {yangmi_dir}")
+    
+    available_negatives = []
+    for name, path in ethnic_dirs.items():
+        if os.path.exists(path):
+            count = len(trainer._get_image_files(path)) if 'trainer' in locals() else 'N/A'
+            print(f"✓ {name}: {path}")
+            available_negatives.append(name)
+        else:
+            print(f"✗ {name}: {path} (not found)")
+    
+    if len(available_negatives) == 0:
+        print("ERROR: No negative sample directories found!")
+        return
+    
+    # Initialize trainer
+    try:
+        trainer = AdaFaceYangMiMultiEthnicTrainer(
+            architecture='ir_50',
+            pretrained_path='pretrained/adaface_ir50_ms1mv2.ckpt'
+        )
+    except Exception as e:
+        print(f"Error initializing trainer: {e}")
+        return
+    
+    # Update available negatives count
+    print(f"\nAvailable negative sample groups: {len(available_negatives)}")
+    for name, path in ethnic_dirs.items():
+        if os.path.exists(path):
+            count = len(trainer._get_image_files(path))
+            print(f"  {name}: {count} images")
     
     try:
-        print("\n=== Preparing Training Data ===")
-        train_loader, val_loader = finetuner.prepare_training_data(
-            gallery_dir, negative_dir, batch_size=8
+        print("\n=== Preparing Multi-Celebrity Training Data ===")
+        train_loader, val_loader = trainer.prepare_multiethnic_data(
+            yangmi_dir, ethnic_dirs, batch_size=8
         )
         
-        print("\n=== Fine-tuning AdaFace Model ===")
-        history = finetuner.train_model(train_loader, val_loader, num_epochs=15)
+        if len(train_loader) == 0:
+            print("ERROR: No training data found!")
+            return
         
-        # Test the fine-tuned model
-        if os.path.exists(test_dir):
-            print("\n=== Evaluating Fine-tuned AdaFace Model ===")
-            results = finetuner.evaluate_on_test(test_dir)
+        print("\n=== Training AdaFace Model with Multi-Celebrity Data ===")
+        history = trainer.train_model(train_loader, val_loader, num_epochs=15)
+        
+        # Test the trained model on all available test directories
+        print("\n=== Evaluating Trained Model ===")
+        all_results = []
+        
+        for test_dir in test_dirs:
+            if os.path.exists(test_dir):
+                print(f"\nTesting on: {test_dir}")
+                results = trainer.evaluate_on_test(test_dir)
+                
+                if results:
+                    # Add source info to results
+                    for result in results:
+                        result['test_source'] = os.path.basename(test_dir)
+                        result['expected_yangmi'] = 'yangmi' in test_dir.lower()
+                    
+                    all_results.extend(results)
+                    
+                    # Quick summary for this test set
+                    yangmi_detected = sum(1 for r in results if r['is_yangmi'])
+                    expected_yangmi = 'yangmi' in test_dir.lower()
+                    print(f"  {test_dir}: {yangmi_detected}/{len(results)} classified as YangMi (Expected YangMi: {expected_yangmi})")
+        
+        if all_results:
+            print(f"\n=== COMPREHENSIVE TEST RESULTS ===")
             
-            if results:
-                print(f"Test evaluation completed: {len(results)} images processed")
-                
-                # Create results report
-                df = pd.DataFrame(results)
-                df.to_csv('adaface_finetuning_results.csv', index=False)
-                
-                # Summary statistics
-                yangmi_detected = sum(1 for r in results if r['is_yangmi'])
-                avg_prob = np.mean([r['yangmi_probability'] for r in results])
-                avg_conf = np.mean([r['confidence'] for r in results])
-                avg_norm = np.mean([r['feature_norm'] for r in results])
-                
-                print(f"\n=== FINAL RESULTS SUMMARY ===")
-                print(f"Images classified as YangMi: {yangmi_detected}/{len(results)}")
-                print(f"Average YangMi probability: {avg_prob:.4f}")
-                print(f"Average confidence: {avg_conf:.4f}")
-                print(f"Average feature norm: {avg_norm:.4f}")
-                print(f"Results saved to 'adaface_finetuning_results.csv'")
+            # Create detailed results
+            df = pd.DataFrame(all_results)
+            df.to_csv('adaface_comprehensive_results.csv', index=False)
+            
+            # Overall statistics
+            total_tested = len(all_results)
+            total_yangmi_detected = sum(1 for r in all_results if r['is_yangmi'])
+            
+            # YangMi test performance (true positives)
+            yangmi_tests = [r for r in all_results if r['expected_yangmi']]
+            yangmi_detected_correctly = sum(1 for r in yangmi_tests if r['is_yangmi'])
+            yangmi_recall = yangmi_detected_correctly / len(yangmi_tests) if yangmi_tests else 0
+            
+            # Non-YangMi test performance (true negatives) 
+            non_yangmi_tests = [r for r in all_results if not r['expected_yangmi']]
+            non_yangmi_rejected_correctly = sum(1 for r in non_yangmi_tests if not r['is_yangmi'])
+            non_yangmi_precision = non_yangmi_rejected_correctly / len(non_yangmi_tests) if non_yangmi_tests else 0
+            
+            print(f"Total images tested: {total_tested}")
+            print(f"Total classified as YangMi: {total_yangmi_detected}")
+            print(f"YangMi Recall (True Positives): {yangmi_recall:.2%} ({yangmi_detected_correctly}/{len(yangmi_tests)})")
+            print(f"Non-YangMi Precision (True Negatives): {non_yangmi_precision:.2%} ({non_yangmi_rejected_correctly}/{len(non_yangmi_tests)})")
+            
+            # Per-celebrity breakdown
+            print(f"\nPer-celebrity performance:")
+            for test_dir in test_dirs:
+                if os.path.exists(test_dir):
+                    celebrity_results = [r for r in all_results if r['test_source'] == os.path.basename(test_dir)]
+                    if celebrity_results:
+                        detected = sum(1 for r in celebrity_results if r['is_yangmi'])
+                        avg_prob = np.mean([r['yangmi_probability'] for r in celebrity_results])
+                        expected = celebrity_results[0]['expected_yangmi']
+                        status = "✓" if (detected > len(celebrity_results)/2) == expected else "✗"
+                        print(f"  {status} {os.path.basename(test_dir)}: {detected}/{len(celebrity_results)} as YangMi (avg prob: {avg_prob:.3f})")
+            
+            print(f"\nDetailed results saved to 'adaface_comprehensive_results.csv'")
+        else:
+            print("No test directories found or no valid test results")
         
-        print("\n=== Fine-tuning Complete ===")
-        print("Check 'best_adaface_yangmi_model.pth' for the trained model")
+        print("\n=== Multi-Celebrity Training Complete ===")
+        print("Check 'best_adaface_yangmi_multiethnic.pth' for the trained model")
         
     except Exception as e:
-        print(f"Error during fine-tuning: {e}")
+        print(f"Error during training: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
